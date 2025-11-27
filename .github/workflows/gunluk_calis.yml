@@ -1,0 +1,41 @@
+name: Otomatik Belgesel Guncelleyici
+
+on:
+  schedule:
+    # Türkiye saati (UTC+3) ile 12:00 olması için buraya 09:00 yazıyoruz.
+    - cron: '0 9 * * *'
+  
+  # İstersen elle butonla çalıştırmak için:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # Dosyayı kaydedebilmesi için bu izin şart
+
+    steps:
+      - name: Depoyu Çek (Checkout)
+        uses: actions/checkout@v3
+
+      - name: Python Kur
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Kütüphaneleri Yükle
+        run: |
+          pip install -r requirements.txt
+
+      - name: Kodları Çalıştır
+        run: |
+          python main.py
+
+      - name: M3U Dosyasını Kaydet ve Yükle
+        run: |
+          git config --global user.name "Otomatik Bot"
+          git config --global user.email "bot@github.com"
+          git add playlist.m3u
+          # Eğer değişiklik varsa kaydet, yoksa hata verme
+          git commit -m "Günlük Otomatik Güncelleme" || exit 0
+          git push
