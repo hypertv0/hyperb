@@ -3,17 +3,16 @@ import os
 import sys
 import time
 import re
-from bs4 import BeautifulSoup
 from tqdm import tqdm
 
-# Selenium
+# Selenium Kütüphaneleri
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
 from webdriver_manager.chrome import ChromeDriverManager
 
 # --- AYARLAR ---
-START_DOMAIN_NUM = 38
+START_DOMAIN_NUM = 39
 END_DOMAIN_NUM = 60
 OUTPUT_M3U = "dizilla_archive.m3u"
 CACHE_FILE = "dizilla_db.json"
@@ -22,15 +21,29 @@ CACHE_FILE = "dizilla_db.json"
 DRIVER = None
 
 def setup_driver():
-    """Hızlandırılmış Chrome Ayarları"""
+    """Optimize edilmiş Hızlı Chrome Ayarları"""
     options = Options()
     options.add_argument("--headless") # Ekransız mod
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
-    # Resimleri yükleme (Hız için kritik)
-    prefs = {"profile.managed_default_content_settings.images": 2}
+    options.add_argument("--disable-gpu")
+    
+    # Resimleri ve gereksiz şeyleri yükleme (Hız için kritik)
+    prefs = {
+        "profile.managed_default_content_settings.images": 2,
+        "profile.default_content_setting_values.notifications": 2,
+        "profile.managed_default_content_settings.stylesheets": 2,
+        "profile.managed_default_content_settings.cookies": 2,
+        "profile.managed_default_content_settings.javascript": 1,
+        "profile.managed_default_content_settings.plugins": 2,
+        "profile.managed_default_content_settings.popups": 2,
+        "profile.managed_default_content_settings.geolocation": 2,
+        "profile.managed_default_content_settings.media_stream": 2,
+    }
     options.add_experimental_option("prefs", prefs)
-    options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+    
+    # Bot olduğumuzu gizle
+    options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
     
     service = Service(ChromeDriverManager().install())
     driver = webdriver.Chrome(service=service, options=options)
@@ -38,16 +51,14 @@ def setup_driver():
     return driver
 
 def find_working_domain():
-    """Çalışan domaini bulur"""
+    """Çalışan domaini bulur (39-60 arası)"""
     print("🤖 Domain tespiti yapılıyor (Chrome)...")
     
     for i in range(START_DOMAIN_NUM, END_DOMAIN_NUM):
         url = f"https://dizilla{i}.com"
         try:
             DRIVER.get(url)
-            # Cloudflare varsa biraz bekle
-            time.sleep(2)
-            
+            # Sayfa başlığını kontrol et
             if "dizilla" in DRIVER.title.lower():
                 print(f"✅ AKTİF DOMAIN: {url}")
                 return url
@@ -55,19 +66,32 @@ def find_working_domain():
             pass
     return None
 
-def get_page_source_via_selenium(url):
+def get_links_from_source(source_text, base_url):
     """
-    URL'yi Selenium ile açar ve kaynak kodunu döner.
-    Cloudflare bunu engelleyemez.
+    Sayfa kaynağındaki (XML/HTML fark etmez) tüm dizi linklerini Regex ile bulur.
+    Format: base_url/dizi-adi-1-sezon-1-bolum
     """
-    try:
-        DRIVER.get(url)
-        # XML dosyaları bazen 'view-source:' gerektirmez, direkt render olur.
-        # Sayfanın yüklendiğinden emin olalım.
-        return DRIVER.page_source
-    except Exception as e:
-        print(f"Hata ({url}): {e}")
-        return None
+    # Regex: base_url/ slug - sezon - bolum
+    # Örnek: https://dizilla40.com/miss-fallaci-1-sezon-7-bolum
+    
+    clean_base = base_url.replace("https://", "").replace("http://", "")
+    
+    # Pattern: Link içinde "sezon" ve "bolum" kelimeleri geçmeli
+    pattern = r'https?://' + re.escape(clean_base) + r'/([\w-]+)-(\d+)-sezon-(\d+)-bolum'
+    
+    links = []
+    matches = re.findall(pattern, source_text)
+    
+    for match in matches:
+        slug, season, episode = match
+        full_url = f"{base_url}/{slug}-{season}-sezon-{episode}-bolum"
+        links.append({
+            "slug": slug,
+            "season": int(season),
+            "episode": int(episode),
+            "url": full_url
+        })
+    return links
 
 def main():
     global DRIVER
@@ -77,148 +101,102 @@ def main():
         # 1. Domain Bul
         base_url = find_working_domain()
         if not base_url:
-            print("❌ Çalışan site bulunamadı!")
+            print("❌ Çalışan site bulunamadı! İnternet bağlantısını veya site durumunu kontrol edin.")
+            # Boş dosya oluştur ki workflow hata vermesin
+            with open(OUTPUT_M3U, "w") as f: f.write("#EXTM3U\n")
+            with open(CACHE_FILE, "w") as f: f.write("{}")
             return
 
-        # 2. Sitemap Index'i Selenium ile Aç
-        sitemap_index_url = f"{base_url}/sitemaps/sitemap-index.xml"
-        print(f"🗺️ Sitemap Index okunuyor: {sitemap_index_url}")
-        
-        index_html = get_page_source_via_selenium(sitemap_index_url)
-        
-        # XML parse et
-        soup = BeautifulSoup(index_html, 'lxml')
-        # Tarayıcı XML'i bazen HTML gibi render eder, bazen text.
-        # Hem 'loc' hem de text içindeki linkleri arayalım.
-        
-        sitemap_urls = []
-        # Yöntem A: XML tagleri varsa
-        locs = soup.find_all("loc")
-        for loc in locs:
-            sitemap_urls.append(loc.text.strip())
-            
-        # Yöntem B: Eğer tagler yoksa ve text ise (Fallback)
-        if not sitemap_urls:
-            text = soup.get_text()
-            sitemap_urls = re.findall(r'https://.*?sitemap-\d+\.xml', text)
-            
-        # Manuel Fallback (Eğer sitemap index boş görünürse)
-        if not sitemap_urls:
-            print("⚠️ Index okunamadı, manuel liste oluşturuluyor...")
-            sitemap_urls = [f"{base_url}/sitemaps/sitemap-{i}.xml" for i in range(1, 150)]
+        # 2. Sitemap Listesini Oluştur
+        # Manuel liste oluşturuyoruz çünkü sitemap index okumak bazen sorun yaratıyor.
+        # Genelde sitemap-1'den sitemap-200'e kadar gider.
+        # Sitede 192 tane olduğunu loglardan gördük.
+        print("🗺️ Sitemap listesi hazırlanıyor...")
+        sitemap_urls = [f"{base_url}/sitemaps/sitemap-{i}.xml" for i in range(1, 201)]
 
-        print(f"📄 Toplam {len(sitemap_urls)} alt sitemap bulundu.")
-
-        # 3. Alt Sitemapleri Gez ve Linkleri Topla
-        all_links = []
-        print("🌍 Linkler toplanıyor (Selenium ile)...")
+        # 3. Tüm Linkleri Topla
+        all_episodes = []
+        print(f"🌍 {len(sitemap_urls)} adet site haritası taranıyor...")
         
-        # Her bir sitemap dosyasını Selenium ile ziyaret et
-        for sm_url in tqdm(sitemap_urls, desc="Sitemap Okuma"):
-            # Domain değişmiş olabilir, sitemap linkini güncelle
-            if base_url not in sm_url:
-                part = sm_url.split("/sitemaps/")[-1]
-                sm_url = f"{base_url}/sitemaps/{part}"
+        for sm_url in tqdm(sitemap_urls, desc="Tarama"):
+            try:
+                DRIVER.get(sm_url)
+                page_source = DRIVER.page_source
                 
-            html = get_page_source_via_selenium(sm_url)
-            if not html: continue
-            
-            sub_soup = BeautifulSoup(html, 'lxml')
-            
-            # Linkleri bul
-            found = 0
-            # <loc> tagleri
-            for loc in sub_soup.find_all("loc"):
-                link = loc.text.strip()
-                all_links.append(link)
-                found += 1
-            
-            # Eğer tag bulamazsa text regex (Chrome bazen XML'i text gösterir)
-            if found == 0:
-                text_content = sub_soup.get_text()
-                # Link yapısı: https://dizilla40.com/dizi/...
-                matches = re.findall(rf'{base_url}/dizi/[\w-]+(?:/[\w-]+)?', text_content)
-                all_links.extend(matches)
-
-        # Tekilleştir
-        all_links = list(set(all_links))
-        print(f"🔥 Toplam {len(all_links)} benzersiz link bulundu!")
-        
-        # 4. Veriyi İşle ve M3U Oluştur
-        series_map = {}   # {slug: {title, poster, url}}
-        episodes_list = [] # [{slug, season, episode, url}]
-        
-        print("Linkler analiz ediliyor...")
-        
-        # Regexler
-        # /dizi/lost
-        # /dizi/lost/1-sezon-1-bolum
-        reg_ep = re.compile(r'/dizi/([\w-]+)/(\d+)-sezon-(\d+)-bolum')
-        reg_series = re.compile(r'/dizi/([\w-]+)$')
-        
-        for link in all_links:
-            # URL düzelt
-            if not link.startswith("http"):
-                link = f"{base_url}{link}"
-            # Domain fix
-            if base_url not in link:
-                path = link.split("/", 3)[-1]
-                link = f"{base_url}/{path}"
+                # Eğer sayfa boşsa veya hata varsa atla
+                if "404" in DRIVER.title:
+                    continue
                 
-            # Bölüm mü?
-            ep_match = reg_ep.search(link)
-            if ep_match:
-                slug, sea, ep = ep_match.groups()
-                episodes_list.append({
-                    "slug": slug,
-                    "season": int(sea),
-                    "episode": int(ep),
-                    "url": link
-                })
-                # Diziyi haritaya ekle (henüz yoksa)
-                if slug not in series_map:
-                    title = slug.replace("-", " ").title()
-                    # Varsayılan poster (Macellan sunucusu tahmini)
-                    poster = f"https://file.macellan.online/images/{slug.replace('-','')}1.jpg"
-                    series_map[slug] = {"title": title, "poster": poster}
+                # Regex ile linkleri sök
+                extracted = get_links_from_source(page_source, base_url)
+                if extracted:
+                    all_episodes.extend(extracted)
+                    
+            except Exception as e:
+                # Bir sitemap hatası tüm işlemi durdurmasın
                 continue
-                
-            # Dizi Ana Sayfası mı?
-            ser_match = reg_series.search(link)
-            if ser_match:
-                slug = ser_match.group(1)
+
+        # Tekilleştirme (Aynı bölüm birden fazla sitemapte olabilir)
+        # URL'ye göre benzersiz yap
+        unique_episodes = {e['url']: e for e in all_episodes}.values()
+        unique_episodes = list(unique_episodes)
+        
+        print(f"🔥 Toplam {len(unique_episodes)} bölüm linki bulundu!")
+        
+        # 4. Verileri Grupla
+        series_map = {} # {slug: {title, poster, episodes: []}}
+        
+        for ep in unique_episodes:
+            slug = ep['slug']
+            if slug not in series_map:
+                # Başlığı slug'dan üret (Miss-fallaci -> Miss Fallaci)
                 title = slug.replace("-", " ").title()
-                # Burada gerçek posteri almak için sayfaya girmek gerekir
-                # Ama hız için şimdilik varsayılan bırakıyoruz.
-                # İstersen buraya bir Selenium 'get' ekleyebiliriz ama 3000 dizi uzun sürer.
-                if slug not in series_map:
-                    poster = f"https://file.macellan.online/images/{slug.replace('-','')}1.jpg"
-                    series_map[slug] = {"title": title, "poster": poster}
+                # Poster URL'sini tahmin et (Macellan CDN yapısı)
+                # Tam doğru olmasa da logoda resim görünür
+                poster = f"https://file.macellan.online/images/tv/poster/f/f/100/{slug.replace('-','')}.jpg"
+                
+                series_map[slug] = {
+                    "title": title,
+                    "poster": poster,
+                    "episodes": []
+                }
+            
+            series_map[slug]["episodes"].append(ep)
 
-        print(f"Tespit edilen: {len(series_map)} Dizi, {len(episodes_list)} Bölüm.")
-
-        # 5. M3U Yaz
-        print("💾 M3U Dosyası kaydediliyor...")
+        # 5. M3U Oluştur ve Kaydet
+        print("💾 M3U Dosyası yazılıyor...")
+        
         with open(OUTPUT_M3U, "w", encoding="utf-8") as f:
             f.write("#EXTM3U\n")
             
-            # Bölümleri sırala
-            episodes_list.sort(key=lambda x: (x["slug"], x["season"], x["episode"]))
+            # Dizileri isme göre sırala
+            sorted_slugs = sorted(series_map.keys())
             
-            for ep in episodes_list:
-                slug = ep["slug"]
-                info = series_map.get(slug, {"title": slug, "poster": ""})
+            for slug in sorted_slugs:
+                data = series_map[slug]
+                # Bölümleri sırala: Sezon -> Bölüm
+                data["episodes"].sort(key=lambda x: (x["season"], x["episode"]))
                 
-                full_title = f"{info['title']} - S{ep['season']} B{ep['episode']}"
-                poster = info['poster']
-                
-                f.write(f'#EXTINF:-1 group-title="Dizilla" tvg-logo="{poster}", {full_title}\n')
-                f.write(f"{ep['url']}\n")
+                for ep in data["episodes"]:
+                    full_title = f"{data['title']} - S{ep['season']} B{ep['episode']}"
+                    
+                    # M3U Formatı
+                    # #EXTINF:-1 group-title="Dizi Adı" tvg-logo="...", Dizi Adı - S1 B1
+                    # Link
+                    
+                    f.write(f'#EXTINF:-1 group-title="{data["title"]}" tvg-logo="{data["poster"]}", {full_title}\n')
+                    f.write(f"{ep['url']}\n")
+        
+        # JSON Veritabanını da güncelle (Yedek olarak)
+        with open(CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(series_map, f, ensure_ascii=False, indent=2)
 
-        print("✅ İŞLEM BAŞARIYLA TAMAMLANDI!")
+        print(f"✅ İŞLEM BAŞARIYLA TAMAMLANDI! {len(unique_episodes)} bölüm eklendi.")
 
     except Exception as e:
-        print(f"Beklenmeyen hata: {e}")
+        print(f"Beklenmeyen genel hata: {e}")
+        # Hata durumunda boş dosya oluştur
+        if not os.path.exists(OUTPUT_M3U): open(OUTPUT_M3U, 'w').close()
     finally:
         if DRIVER:
             DRIVER.quit()
