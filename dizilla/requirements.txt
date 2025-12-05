@@ -1,0 +1,6 @@
+aiohttp
+aiodns
+cchardet
+pycryptodome
+beautifulsoup4
+tqdm
