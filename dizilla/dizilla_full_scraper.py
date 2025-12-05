@@ -11,49 +11,20 @@ from bs4 import BeautifulSoup
 from tqdm.asyncio import tqdm
 
 # --- AYARLAR ---
-# Bu ana domaindir, script buradan güncel adrese (örn: dizilla44.com) yönlenecek.
-START_URL = "https://dizilla.club" 
+# Bu aralıkta tarama yapacak. Site şu an 40'larda olduğu için 38-60 arası ideal.
+DOMAIN_RANGE_START = 38
+DOMAIN_RANGE_END = 60
 AES_KEY = b"9bYMCNQiWsXIYFWYAu7EkdsSbmGBTyUI"
 OUTPUT_M3U = "dizilla_archive.m3u"
 CACHE_FILE = "dizilla_db.json"
-MAX_CONCURRENT_REQUESTS = 5 # Cloudflare varken sayıyı düşürmek daha güvenlidir
+MAX_CONCURRENT_REQUESTS = 5 
 SEM = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
 
-# Global değişken (Dinamik olarak güncellenecek)
+# Global değişken (Kod bulup buraya atayacak)
 CURRENT_BASE_URL = ""
 
-def get_cloudflare_tokens():
-    """
-    Cloudscraper kullanarak Cloudflare engelini aşar,
-    güncel domaini bulur ve cookie'leri döner.
-    """
-    print("Cloudflare koruması aşılıyor ve güncel adres aranıyor...")
-    try:
-        # Browser gibi davranacak scraper oluştur
-        scraper = cloudscraper.create_scraper(
-            browser={
-                'browser': 'chrome',
-                'platform': 'windows',
-                'desktop': True
-            }
-        )
-        
-        # Siteye ilk isteği at
-        resp = scraper.get(START_URL, timeout=15)
-        
-        # Yönlenilen son adresi al (Örn: https://dizilla44.com/)
-        final_url = resp.url.rstrip("/")
-        cookies = scraper.cookies.get_dict()
-        user_agent = scraper.headers.get("User-Agent")
-        
-        print(f"✅ Cloudflare aşıldı! Güncel Adres: {final_url}")
-        return final_url, cookies, user_agent
-        
-    except Exception as e:
-        print(f"❌ Cloudflare hatası: {e}")
-        return None, None, None
-
 def decrypt_dizilla_response(encrypted_str):
+    """AES Şifre Çözücü"""
     try:
         if not encrypted_str: return None
         iv = bytes(16)
@@ -62,13 +33,72 @@ def decrypt_dizilla_response(encrypted_str):
         decrypted = cipher.decrypt(decoded_b64)
         padding_len = decrypted[-1]
         return decrypted[:-padding_len].decode('utf-8')
-    except Exception as e:
+    except Exception:
         return None
+
+def find_active_domain():
+    """
+    Doğru API adresini bulmak için dizillaXX.com adreslerini dener.
+    Sadece sayfası açılanı değil, API'si çalışanı seçer.
+    """
+    print("🔍 Güncel ve çalışan Dizilla domaini aranıyor...")
+    
+    # Gerçek bir tarayıcı gibi davran
+    scraper = cloudscraper.create_scraper(
+        browser={'browser': 'chrome', 'platform': 'windows', 'desktop': True}
+    )
+    
+    # Denenecekler listesi (Önce bilinen yönlendirme, sonra numaralılar)
+    candidates = ["https://dizilla.club"] 
+    # 40, 41, 42... şeklinde ekle
+    for i in range(DOMAIN_RANGE_START, DOMAIN_RANGE_END):
+        candidates.append(f"https://dizilla{i}.com")
+
+    for domain in candidates:
+        try:
+            # Önce domainin kendisine bir ping atalım (Hızlı eleme)
+            try:
+                head = scraper.head(domain, timeout=5)
+                if head.status_code >= 400 and head.status_code != 403:
+                    print(f" ❌ {domain} (Ulaşılamıyor)")
+                    continue
+            except:
+                pass
+
+            # Şimdi ASIL test: API isteği at
+            # Eğer bu istek dönerse, site kesinlikle çalışıyordur.
+            api_url = f"{domain}/api/bg/findSeries?releaseYearStart=2024&currentPage=1&currentPageCount=1"
+            headers = {
+                "Referer": f"{domain}/arsiv",
+                "X-Requested-With": "XMLHttpRequest"
+            }
+            
+            # print(f"Testing API: {domain} ...", end="")
+            api_resp = scraper.post(api_url, headers=headers, timeout=10)
+            
+            if api_resp.status_code == 200:
+                json_resp = api_resp.json()
+                # Şifreli yanıtı kontrol et
+                if "response" in json_resp:
+                    dec = decrypt_dizilla_response(json_resp["response"])
+                    if dec and ("items" in dec or "result" in dec):
+                        print(f"\n ✅ BULUNDU! Güncel Adres: {domain}")
+                        
+                        # Cloudflare cookie'lerini alıp dön
+                        cookies = scraper.cookies.get_dict()
+                        ua = scraper.headers.get("User-Agent")
+                        return domain, cookies, ua
+            
+            # print(" (Başarısız)")
+        except Exception as e:
+            # Hata varsa (Timeout, Connection Error) geç
+            pass
+
+    return None, None, None
 
 async def fetch_url(session, url, method="GET", data=None, headers=None):
     async with SEM:
         try:
-            # Cloudscraper'dan gelen headerları koru, üzerine ekle
             req_headers = {
                 "Referer": f"{CURRENT_BASE_URL}/arsiv",
                 "Origin": CURRENT_BASE_URL,
@@ -83,57 +113,58 @@ async def fetch_url(session, url, method="GET", data=None, headers=None):
                         return await response.json()
                     except:
                         return await response.text()
-                else:
-                    # Debug için status code
-                    # print(f"HTTP {response.status}: {url}") 
-                    return None
+                return None
         except Exception:
             return None
 
 async def scrape_series_page(session, page_num):
     url = f"{CURRENT_BASE_URL}/api/bg/findSeries?releaseYearStart=1900&releaseYearEnd=2026&imdbPointMin=0&imdbPointMax=10&categoryIdsComma=&countryIdsComma=&orderType=date_desc&languageId=-1&currentPage={page_num}&currentPageCount=24"
+    
     resp = await fetch_url(session, url, method="POST")
     series_list = []
     
     if isinstance(resp, dict):
         enc = resp.get("response")
-        if enc:
-            dec = decrypt_dizilla_response(enc)
-            if dec:
-                try:
-                    data = json.loads(dec)
-                    items = data.get("items") or data.get("result") or []
-                    for item in items:
-                        slug = item.get("used_slug")
-                        if not slug: continue
-                        
-                        # Poster işlemleri
-                        poster = item.get("poster_url", "")
-                        if poster:
-                            poster = poster.replace("images-macellan-online.cdn.ampproject.org/i/s/", "") \
-                                           .replace("file.dizilla.club", "file.macellan.online") \
-                                           .replace("/f/f/", "/630/910/")
-                        
-                        category = "Genel"
-                        title = item.get("original_title", "Bilinmeyen")
-                        if "kore" in str(item).lower(): category = "Kore Dizileri"
-                        elif "anime" in str(item).lower(): category = "Anime"
-                        
-                        series_list.append({
-                            "id": slug,
-                            "title": title,
-                            "url": f"{CURRENT_BASE_URL}/{slug}",
-                            "poster": poster,
-                            "category": category,
-                            "episodes": []
-                        })
-                except:
-                    pass
+        dec = decrypt_dizilla_response(enc)
+        if dec:
+            try:
+                data = json.loads(dec)
+                items = data.get("items") or data.get("result") or []
+                
+                for item in items:
+                    slug = item.get("used_slug")
+                    if not slug: continue
+                    
+                    poster = item.get("poster_url", "")
+                    if poster:
+                        poster = poster.replace("images-macellan-online.cdn.ampproject.org/i/s/", "") \
+                                       .replace("file.dizilla.club", "file.macellan.online") \
+                                       .replace("/f/f/", "/630/910/")
+                        if not poster.startswith("http"):
+                             poster = f"https://file.macellan.online/{poster.lstrip('/')}" if "macellan" not in poster else poster
+
+                    category = "Dizi"
+                    title = item.get("original_title") or item.get("title") or "Bilinmeyen"
+                    
+                    if "kore" in str(item).lower(): category = "Kore Dizileri"
+                    elif "anime" in str(item).lower(): category = "Anime"
+                    
+                    full_url = f"{CURRENT_BASE_URL}/{slug}"
+                    
+                    series_list.append({
+                        "id": slug,
+                        "title": title,
+                        "url": full_url,
+                        "poster": poster,
+                        "category": category,
+                        "episodes": []
+                    })
+            except Exception:
+                pass
     return series_list
 
 async def process_series(session, series_data):
     try:
-        # URL'yi güncel domain ile güncelle (db'den eski domain gelirse diye)
         slug = series_data["id"]
         current_series_url = f"{CURRENT_BASE_URL}/{slug}"
         
@@ -142,25 +173,31 @@ async def process_series(session, series_data):
         
         soup = BeautifulSoup(html, 'html.parser')
         episodes_list = []
+        
         season_links = soup.select("div.flex.items-center.flex-wrap.gap-2.mb-4 a")
         
-        urls_to_scan = [current_series_url] + [
-            (l.get("href") if l.get("href").startswith("http") else f"{CURRENT_BASE_URL}{l.get('href')}") 
-            for l in season_links
-        ]
+        urls_to_scan = [current_series_url]
+        for l in season_links:
+            href = l.get("href")
+            if href:
+                if href.startswith("http"):
+                    if CURRENT_BASE_URL not in href:
+                        # Domain farklıysa linki onar
+                        path = href.split("/", 3)[-1]
+                        urls_to_scan.append(f"{CURRENT_BASE_URL}/{path}")
+                    else:
+                        urls_to_scan.append(href)
+                else:
+                    urls_to_scan.append(f"{CURRENT_BASE_URL}{href}")
+        
         urls_to_scan = list(set(urls_to_scan))
         
         for s_url in urls_to_scan:
-            # Domain kontrolü ve düzeltme
-            if not s_url.startswith(CURRENT_BASE_URL):
-                # Eğer link eski domainde kaldıysa güncelle
-                path = s_url.split("/", 3)[-1] if s_url.startswith("http") else s_url
-                s_url = f"{CURRENT_BASE_URL}/{path}"
-
             s_html = await fetch_url(session, s_url)
             if not s_html or not isinstance(s_html, str): continue
             
             s_soup = BeautifulSoup(s_html, 'html.parser')
+            
             season_match = re.search(r'-(\d+)-sezon', s_url)
             season_num = season_match.group(1) if season_match else "1"
             
@@ -172,7 +209,15 @@ async def process_series(session, series_data):
                 ep_href = a_tag.get("href")
                 if not ep_href: continue
                 
-                full_ep_url = ep_href if ep_href.startswith("http") else f"{CURRENT_BASE_URL}{ep_href}"
+                if ep_href.startswith("http"):
+                    if CURRENT_BASE_URL not in ep_href:
+                        path = ep_href.split("/", 3)[-1]
+                        full_ep_url = f"{CURRENT_BASE_URL}/{path}"
+                    else:
+                        full_ep_url = ep_href
+                else:
+                    full_ep_url = f"{CURRENT_BASE_URL}{ep_href}"
+
                 ep_name = a_tag.get_text(strip=True)
                 
                 episodes_list.append({
@@ -181,33 +226,28 @@ async def process_series(session, series_data):
                     "url": full_ep_url
                 })
         
-        # Sadece yeni veri bulduysak güncelle, yoksa eskisini koru
         if episodes_list:
             series_data["episodes"] = episodes_list
             
         return series_data
-    except:
+    except Exception:
         return series_data
 
 async def main():
     global CURRENT_BASE_URL
     
-    # 1. Cloudscraper ile yetki al
-    final_url, cookies, ua = get_cloudflare_tokens()
+    # 1. Otomatik Domain Bulucu
+    active_domain, cookies, ua = find_active_domain()
     
-    if not final_url:
-        print("!!! Kritik Hata: Siteye girilemedi. Çıkılıyor.")
-        # Git hatası olmasın diye boş dosyaları oluştur
+    if not active_domain:
+        print("!!! KRİTİK: Çalışan domain bulunamadı. Lütfen DOMAIN_RANGE ayarlarını kontrol et.")
         if not os.path.exists(OUTPUT_M3U): open(OUTPUT_M3U, 'w').close()
         if not os.path.exists(CACHE_FILE): open(CACHE_FILE, 'w').write("{}")
         return
 
-    CURRENT_BASE_URL = final_url
+    CURRENT_BASE_URL = active_domain
     
-    # SSL hatalarını yoksay
     connector = aiohttp.TCPConnector(ssl=False)
-    
-    # Cloudscraper'dan aldığımız cookies ve header'ı aiohttp'ye veriyoruz
     headers = {"User-Agent": ua}
     
     db = {}
@@ -218,11 +258,10 @@ async def main():
         except: pass
 
     async with aiohttp.ClientSession(connector=connector, cookies=cookies, headers=headers) as session:
-        print(f"Oturum açıldı. Tarama başlıyor: {CURRENT_BASE_URL}")
+        print(f"Veri çekme işlemi başladı: {CURRENT_BASE_URL}")
         
-        # 2. Sayfaları Tara
-        # Deneme amaçlı 20 sayfa. Sorun yoksa 150 yap.
-        tasks = [scrape_series_page(session, i) for i in range(1, 21)] 
+        # İlk etapta son 50 sayfayı tara (Hız ve güncellik için)
+        tasks = [scrape_series_page(session, i) for i in range(1, 51)]
         
         results = []
         for f in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc="Dizi Listesi"):
@@ -231,38 +270,40 @@ async def main():
             
         print(f"Toplam {len(results)} dizi bulundu.")
         
+        new_items_count = 0
         for s in results:
-            # URL'leri güncel domain ile revize et
-            s["url"] = f"{CURRENT_BASE_URL}/{s['id']}"
-            
+            s["url"] = f"{CURRENT_BASE_URL}/{s['id']}" # URL'yi tazele
             if s["id"] not in db:
                 db[s["id"]] = s
+                new_items_count += 1
             else:
+                # Var olanı güncelle ama bölümleri koru (şimdilik)
                 db[s["id"]]["title"] = s["title"]
-                db[s["id"]]["url"] = s["url"] # URL güncelle
-
-        # 3. Bölümleri Tara (Asıl yoğun kısım)
-        keys_to_scan = list(db.keys())
+                db[s["id"]]["url"] = s["url"]
         
-        # Demo: İlk çalıştırmada çok uzun sürmemesi için limit koyabilirsin
+        print(f"Veritabanına {new_items_count} yeni dizi eklendi.")
+
+        # Bölümleri Tara
+        keys_to_scan = list(db.keys())
+        # Demo: İlk test için 50 dizi. Sorunsuz çalışırsa bu satırı sil veya sayıyı artır.
         # keys_to_scan = keys_to_scan[:50] 
         
         if keys_to_scan:
-            print(f"{len(keys_to_scan)} dizi için bölüm bilgileri taranıyor...")
-            chunk_size = 10 # Cloudflare varken küçük parçalar daha iyidir
+            print(f"{len(keys_to_scan)} dizi taranacak...")
+            chunk_size = 10
             for i in range(0, len(keys_to_scan), chunk_size):
                 chunk = keys_to_scan[i:i+chunk_size]
                 batch_tasks = [process_series(session, db[k]) for k in chunk]
+                
                 scanned_series = await asyncio.gather(*batch_tasks)
                 
                 for s in scanned_series:
                     db[s["id"]] = s
                 
-                # İlerleme kaydı
                 with open(CACHE_FILE, "w", encoding="utf-8") as f:
                     json.dump(db, f, ensure_ascii=False, indent=2)
 
-    # 4. M3U Oluştur
+    # M3U Oluştur
     print(f"M3U oluşturuluyor... ({len(db)} kayıt)")
     with open(OUTPUT_M3U, "w", encoding="utf-8") as f:
         f.write("#EXTM3U\n")
