@@ -1,0 +1,45 @@
+name: Dizilla Botu
+
+on:
+  schedule:
+    - cron: '30 9 * * *' # Her gün TR saatiyle 12:30 (Diğer botla çakışmasın diye yarım saat kaydırdım)
+  workflow_dispatch: # Manuel tetikleme butonu
+
+permissions:
+  contents: write
+
+jobs:
+  scrape_dizilla:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+    - name: Depoyu Çek (Checkout)
+      uses: actions/checkout@v4
+
+    - name: Python Kurulumu
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+
+    - name: Dizilla Kütüphanelerini Yükle
+      # Buraya dikkat: dizilla klasöründeki requirements dosyasını okuyor
+      run: |
+        pip install --upgrade pip
+        pip install -r dizilla/requirements.txt
+
+    - name: Dizilla Scriptini Çalıştır
+      # Scripti dizilla klasörünün içinden çağırıyoruz
+      run: python dizilla/dizilla_full_scraper.py
+
+    - name: Dosyaları Kaydet (Commit & Push)
+      run: |
+        git config --global user.name "DizillaBot"
+        git config --global user.email "bot@dizilla.com"
+        
+        # db dosyasını ve m3u dosyasını ekle
+        # Script çıktıları ana dizine (root) kaydedecek şekilde ayarlandı
+        git add dizilla_db.json dizilla_archive.m3u
+        
+        git commit -m "Dizilla Arşivi Güncellendi: $(date)" || echo "Değişiklik yok"
+        git push
