@@ -5,26 +5,94 @@ import base64
 import re
 import os
 import sys
-import cloudscraper
+import time
 from Crypto.Cipher import AES
 from bs4 import BeautifulSoup
 from tqdm.asyncio import tqdm
 
+# Selenium Kütüphaneleri
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from webdriver_manager.chrome import ChromeDriverManager
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+
 # --- AYARLAR ---
-# Bu aralıkta tarama yapacak. Site şu an 40'larda olduğu için 38-60 arası ideal.
-DOMAIN_RANGE_START = 38
-DOMAIN_RANGE_END = 60
+LANDING_URL = "https://dizilla.club" # Başlangıç noktası
 AES_KEY = b"9bYMCNQiWsXIYFWYAu7EkdsSbmGBTyUI"
 OUTPUT_M3U = "dizilla_archive.m3u"
 CACHE_FILE = "dizilla_db.json"
-MAX_CONCURRENT_REQUESTS = 5 
+MAX_CONCURRENT_REQUESTS = 10 # Selenium ile cookie aldığımız için sayıyı artırabiliriz
 SEM = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
 
-# Global değişken (Kod bulup buraya atayacak)
+# Global değişkenler
 CURRENT_BASE_URL = ""
+HEADERS = {}
+COOKIES = {}
+
+def get_real_domain_and_cookies():
+    """
+    Selenium kullanarak gerçek tarayıcı açar,
+    dizilla.club'a gider, yönlendirmeyi bekler ve
+    güncel domain + çerezleri (cookies) çalar.
+    """
+    print("🤖 Selenium başlatılıyor (Chrome)...")
+    
+    chrome_options = Options()
+    chrome_options.add_argument("--headless") # Ekransız mod (GitHub Actions için şart)
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument("--disable-blink-features=AutomationControlled") # Bot olduğumuzu gizle
+    chrome_options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+    
+    driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=chrome_options)
+    
+    try:
+        print(f"🌍 {LANDING_URL} adresine gidiliyor...")
+        driver.get(LANDING_URL)
+        
+        # Yönlendirme için 10 saniye bekle
+        # Bazen "Siteye Git" butonu olabilir, onu kontrol et
+        time.sleep(5)
+        
+        try:
+            # Eğer sayfada "dizilla" geçen bir link varsa ve buton gibiyse tıkla
+            # (Bu kısım opsiyonel, otomatik yönleniyorsa gerek yok)
+            links = driver.find_elements(By.TAG_NAME, "a")
+            for link in links:
+                href = link.get_attribute("href")
+                if href and "dizilla" in href and "club" not in href:
+                    print(f"🖱️ Buton bulundu, tıklanıyor: {href}")
+                    driver.get(href)
+                    break
+        except:
+            pass
+            
+        time.sleep(5) # İyice yüklenmesini bekle
+
+        final_url = driver.current_url.rstrip("/")
+        user_agent = driver.execute_script("return navigator.userAgent;")
+        selenium_cookies = driver.get_cookies()
+        
+        # Cookie'leri aiohttp formatına çevir
+        cookie_dict = {}
+        for cookie in selenium_cookies:
+            cookie_dict[cookie['name']] = cookie['value']
+            
+        print(f"✅ HEDEF BULUNDU: {final_url}")
+        print(f"🍪 Cookie Sayısı: {len(cookie_dict)}")
+        
+        driver.quit()
+        return final_url, cookie_dict, user_agent
+
+    except Exception as e:
+        print(f"❌ Selenium Hatası: {e}")
+        driver.quit()
+        return None, None, None
 
 def decrypt_dizilla_response(encrypted_str):
-    """AES Şifre Çözücü"""
     try:
         if not encrypted_str: return None
         iv = bytes(16)
@@ -36,76 +104,16 @@ def decrypt_dizilla_response(encrypted_str):
     except Exception:
         return None
 
-def find_active_domain():
-    """
-    Doğru API adresini bulmak için dizillaXX.com adreslerini dener.
-    Sadece sayfası açılanı değil, API'si çalışanı seçer.
-    """
-    print("🔍 Güncel ve çalışan Dizilla domaini aranıyor...")
-    
-    # Gerçek bir tarayıcı gibi davran
-    scraper = cloudscraper.create_scraper(
-        browser={'browser': 'chrome', 'platform': 'windows', 'desktop': True}
-    )
-    
-    # Denenecekler listesi (Önce bilinen yönlendirme, sonra numaralılar)
-    candidates = ["https://dizilla.club"] 
-    # 40, 41, 42... şeklinde ekle
-    for i in range(DOMAIN_RANGE_START, DOMAIN_RANGE_END):
-        candidates.append(f"https://dizilla{i}.com")
-
-    for domain in candidates:
-        try:
-            # Önce domainin kendisine bir ping atalım (Hızlı eleme)
-            try:
-                head = scraper.head(domain, timeout=5)
-                if head.status_code >= 400 and head.status_code != 403:
-                    print(f" ❌ {domain} (Ulaşılamıyor)")
-                    continue
-            except:
-                pass
-
-            # Şimdi ASIL test: API isteği at
-            # Eğer bu istek dönerse, site kesinlikle çalışıyordur.
-            api_url = f"{domain}/api/bg/findSeries?releaseYearStart=2024&currentPage=1&currentPageCount=1"
-            headers = {
-                "Referer": f"{domain}/arsiv",
-                "X-Requested-With": "XMLHttpRequest"
-            }
-            
-            # print(f"Testing API: {domain} ...", end="")
-            api_resp = scraper.post(api_url, headers=headers, timeout=10)
-            
-            if api_resp.status_code == 200:
-                json_resp = api_resp.json()
-                # Şifreli yanıtı kontrol et
-                if "response" in json_resp:
-                    dec = decrypt_dizilla_response(json_resp["response"])
-                    if dec and ("items" in dec or "result" in dec):
-                        print(f"\n ✅ BULUNDU! Güncel Adres: {domain}")
-                        
-                        # Cloudflare cookie'lerini alıp dön
-                        cookies = scraper.cookies.get_dict()
-                        ua = scraper.headers.get("User-Agent")
-                        return domain, cookies, ua
-            
-            # print(" (Başarısız)")
-        except Exception as e:
-            # Hata varsa (Timeout, Connection Error) geç
-            pass
-
-    return None, None, None
-
-async def fetch_url(session, url, method="GET", data=None, headers=None):
+async def fetch_url(session, url, method="GET", data=None, extra_headers=None):
     async with SEM:
         try:
-            req_headers = {
-                "Referer": f"{CURRENT_BASE_URL}/arsiv",
-                "Origin": CURRENT_BASE_URL,
-                "X-Requested-With": "XMLHttpRequest",
-                "Accept": "application/json, text/plain, */*"
-            }
-            if headers: req_headers.update(headers)
+            req_headers = HEADERS.copy()
+            # API istekleri için Referer önemli
+            req_headers["Referer"] = f"{CURRENT_BASE_URL}/arsiv"
+            req_headers["Origin"] = CURRENT_BASE_URL
+            req_headers["X-Requested-With"] = "XMLHttpRequest"
+            
+            if extra_headers: req_headers.update(extra_headers)
             
             async with session.request(method, url, data=data, headers=req_headers, timeout=30) as response:
                 if response.status == 200:
@@ -135,6 +143,7 @@ async def scrape_series_page(session, page_num):
                     slug = item.get("used_slug")
                     if not slug: continue
                     
+                    # Poster URL düzeltme
                     poster = item.get("poster_url", "")
                     if poster:
                         poster = poster.replace("images-macellan-online.cdn.ampproject.org/i/s/", "") \
@@ -182,7 +191,6 @@ async def process_series(session, series_data):
             if href:
                 if href.startswith("http"):
                     if CURRENT_BASE_URL not in href:
-                        # Domain farklıysa linki onar
                         path = href.split("/", 3)[-1]
                         urls_to_scan.append(f"{CURRENT_BASE_URL}/{path}")
                     else:
@@ -234,21 +242,27 @@ async def process_series(session, series_data):
         return series_data
 
 async def main():
-    global CURRENT_BASE_URL
+    global CURRENT_BASE_URL, HEADERS, COOKIES
     
-    # 1. Otomatik Domain Bulucu
-    active_domain, cookies, ua = find_active_domain()
+    # 1. Selenium ile Giriş Yap ve Bilgileri Al
+    real_url, cookies, ua = get_real_domain_and_cookies()
     
-    if not active_domain:
-        print("!!! KRİTİK: Çalışan domain bulunamadı. Lütfen DOMAIN_RANGE ayarlarını kontrol et.")
-        if not os.path.exists(OUTPUT_M3U): open(OUTPUT_M3U, 'w').close()
-        if not os.path.exists(CACHE_FILE): open(CACHE_FILE, 'w').write("{}")
-        return
+    if not real_url or "dizilla.club" in real_url:
+        print("!!! UYARI: Selenium yönlendirmeyi yakalayamadı veya hala landing page'de.")
+        # Fallback: Eğer selenium başarısız olursa manuel tahmini bir domain deneyelim
+        # Ancak Selenium genelde başarılı olur.
+        if real_url: CURRENT_BASE_URL = real_url
+        else: 
+            print("Kritik hata: URL alınamadı.")
+            return
+    else:
+        CURRENT_BASE_URL = real_url
 
-    CURRENT_BASE_URL = active_domain
+    HEADERS = {"User-Agent": ua}
+    COOKIES = cookies
     
+    # SSL hatasını yoksay
     connector = aiohttp.TCPConnector(ssl=False)
-    headers = {"User-Agent": ua}
     
     db = {}
     if os.path.exists(CACHE_FILE):
@@ -257,11 +271,12 @@ async def main():
                 db = json.load(f)
         except: pass
 
-    async with aiohttp.ClientSession(connector=connector, cookies=cookies, headers=headers) as session:
-        print(f"Veri çekme işlemi başladı: {CURRENT_BASE_URL}")
+    async with aiohttp.ClientSession(connector=connector, cookies=COOKIES, headers=HEADERS) as session:
+        print(f"🚀 Hızlı Tarama Başlıyor: {CURRENT_BASE_URL}")
         
-        # İlk etapta son 50 sayfayı tara (Hız ve güncellik için)
-        tasks = [scrape_series_page(session, i) for i in range(1, 51)]
+        # 2. Dizi Listesi (Hızlıca ilk 100 sayfayı tara)
+        # 100 sayfa x 24 dizi = 2400 dizi. Arşiv için yeterli.
+        tasks = [scrape_series_page(session, i) for i in range(1, 101)]
         
         results = []
         for f in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc="Dizi Listesi"):
@@ -270,40 +285,41 @@ async def main():
             
         print(f"Toplam {len(results)} dizi bulundu.")
         
-        new_items_count = 0
+        new_items = 0
         for s in results:
-            s["url"] = f"{CURRENT_BASE_URL}/{s['id']}" # URL'yi tazele
+            s["url"] = f"{CURRENT_BASE_URL}/{s['id']}"
             if s["id"] not in db:
                 db[s["id"]] = s
-                new_items_count += 1
+                new_items += 1
             else:
-                # Var olanı güncelle ama bölümleri koru (şimdilik)
-                db[s["id"]]["title"] = s["title"]
                 db[s["id"]]["url"] = s["url"]
+                db[s["id"]]["title"] = s["title"]
         
-        print(f"Veritabanına {new_items_count} yeni dizi eklendi.")
+        print(f"{new_items} yeni dizi eklendi.")
 
-        # Bölümleri Tara
+        # 3. Bölüm Detayları
         keys_to_scan = list(db.keys())
-        # Demo: İlk test için 50 dizi. Sorunsuz çalışırsa bu satırı sil veya sayıyı artır.
-        # keys_to_scan = keys_to_scan[:50] 
+        # Not: Eğer çok fazla diziyi baştan taramak istemiyorsan
+        # Sadece "episodes" listesi boş olanları filtreleyebilirsin:
+        # keys_to_scan = [k for k, v in db.items() if not v.get("episodes")]
+        # Ama tam güncelleme için hepsini tarayalım:
         
         if keys_to_scan:
             print(f"{len(keys_to_scan)} dizi taranacak...")
-            chunk_size = 10
+            chunk_size = 20
             for i in range(0, len(keys_to_scan), chunk_size):
                 chunk = keys_to_scan[i:i+chunk_size]
                 batch_tasks = [process_series(session, db[k]) for k in chunk]
                 
                 scanned_series = await asyncio.gather(*batch_tasks)
-                
                 for s in scanned_series:
                     db[s["id"]] = s
                 
+                # İlerleme kaydı
                 with open(CACHE_FILE, "w", encoding="utf-8") as f:
                     json.dump(db, f, ensure_ascii=False, indent=2)
 
-    # M3U Oluştur
+    # 4. M3U Oluştur
     print(f"M3U oluşturuluyor... ({len(db)} kayıt)")
     with open(OUTPUT_M3U, "w", encoding="utf-8") as f:
         f.write("#EXTM3U\n")
@@ -314,7 +330,6 @@ async def main():
                 cat = data.get("category", "Genel")
                 poster = data.get("poster", "")
                 url = ep['url']
-                
                 f.write(f'#EXTINF:-1 group-title="{cat}" tvg-logo="{poster}", {title}\n')
                 f.write(f"{url}\n")
 
