@@ -4,3 +4,4 @@ cchardet
 pycryptodome
 beautifulsoup4
 tqdm
+cloudscraper
