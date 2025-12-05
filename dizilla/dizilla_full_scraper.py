@@ -1,12 +1,10 @@
-import asyncio
-import aiohttp
 import json
 import os
 import sys
 import time
 import re
 from bs4 import BeautifulSoup
-from tqdm.asyncio import tqdm
+from tqdm import tqdm
 
 # Selenium
 from selenium import webdriver
@@ -19,291 +17,211 @@ START_DOMAIN_NUM = 38
 END_DOMAIN_NUM = 60
 OUTPUT_M3U = "dizilla_archive.m3u"
 CACHE_FILE = "dizilla_db.json"
-MAX_CONCURRENT_REQUESTS = 50 # XML dosyaları küçüktür, sayıyı artırabiliriz
-SEM = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
 
-# Global Değişkenler
-CURRENT_BASE_URL = ""
-HEADERS = {}
-COOKIES = {}
+# --- GLOBAL ---
+DRIVER = None
 
-def find_working_domain():
-    """
-    Selenium ile çalışan domaini bulur ve cookie alır.
-    """
-    print("🤖 Domain tespiti başlatılıyor (Chrome)...")
+def setup_driver():
+    """Hızlandırılmış Chrome Ayarları"""
     options = Options()
-    options.add_argument("--headless")
+    options.add_argument("--headless") # Ekransız mod
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
+    # Resimleri yükleme (Hız için kritik)
+    prefs = {"profile.managed_default_content_settings.images": 2}
+    options.add_experimental_option("prefs", prefs)
     options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
     
-    driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
-    driver.set_page_load_timeout(20)
+    service = Service(ChromeDriverManager().install())
+    driver = webdriver.Chrome(service=service, options=options)
+    driver.set_page_load_timeout(30)
+    return driver
 
-    found_url = None
-    final_cookies = {}
-    final_ua = ""
-
+def find_working_domain():
+    """Çalışan domaini bulur"""
+    print("🤖 Domain tespiti yapılıyor (Chrome)...")
+    
     for i in range(START_DOMAIN_NUM, END_DOMAIN_NUM):
         url = f"https://dizilla{i}.com"
         try:
-            driver.get(url)
-            time.sleep(3) # Cloudflare
+            DRIVER.get(url)
+            # Cloudflare varsa biraz bekle
+            time.sleep(2)
             
-            if "dizilla" in driver.title.lower():
-                print(f"✅ AKTİF DOMAIN BULUNDU: {url}")
-                found_url = url
-                
-                for c in driver.get_cookies():
-                    final_cookies[c['name']] = c['value']
-                final_ua = driver.execute_script("return navigator.userAgent;")
-                break
-        except:
-            pass
-            
-    driver.quit()
-    return found_url, final_cookies, final_ua
-
-async def fetch_text(session, url):
-    """Verilen URL'in içeriğini (HTML/XML) çeker"""
-    async with SEM:
-        try:
-            headers = HEADERS.copy()
-            async with session.get(url, headers=headers, timeout=30) as resp:
-                if resp.status == 200:
-                    return await resp.text()
+            if "dizilla" in DRIVER.title.lower():
+                print(f"✅ AKTİF DOMAIN: {url}")
+                return url
         except:
             pass
     return None
 
-async def parse_sitemap(session, sitemap_url):
+def get_page_source_via_selenium(url):
     """
-    Bir sitemap XML dosyasını indirir ve içindeki linkleri ayıklar.
+    URL'yi Selenium ile açar ve kaynak kodunu döner.
+    Cloudflare bunu engelleyemez.
     """
-    xml_content = await fetch_text(session, sitemap_url)
-    urls = []
-    if not xml_content: return urls
+    try:
+        DRIVER.get(url)
+        # XML dosyaları bazen 'view-source:' gerektirmez, direkt render olur.
+        # Sayfanın yüklendiğinden emin olalım.
+        return DRIVER.page_source
+    except Exception as e:
+        print(f"Hata ({url}): {e}")
+        return None
+
+def main():
+    global DRIVER
+    DRIVER = setup_driver()
     
     try:
-        # lxml-xml parser çok hızlıdır
-        soup = BeautifulSoup(xml_content, 'lxml-xml')
-        locs = soup.find_all('loc')
+        # 1. Domain Bul
+        base_url = find_working_domain()
+        if not base_url:
+            print("❌ Çalışan site bulunamadı!")
+            return
+
+        # 2. Sitemap Index'i Selenium ile Aç
+        sitemap_index_url = f"{base_url}/sitemaps/sitemap-index.xml"
+        print(f"🗺️ Sitemap Index okunuyor: {sitemap_index_url}")
+        
+        index_html = get_page_source_via_selenium(sitemap_index_url)
+        
+        # XML parse et
+        soup = BeautifulSoup(index_html, 'lxml')
+        # Tarayıcı XML'i bazen HTML gibi render eder, bazen text.
+        # Hem 'loc' hem de text içindeki linkleri arayalım.
+        
+        sitemap_urls = []
+        # Yöntem A: XML tagleri varsa
+        locs = soup.find_all("loc")
         for loc in locs:
-            urls.append(loc.text.strip())
-    except:
-        pass
-    return urls
-
-async def get_series_metadata(session, series_slug, series_url):
-    """
-    Dizinin ana sayfasına girip Poster ve Başlık bilgisini alır.
-    (Sitemap'te bu bilgiler yoktur, o yüzden HTML'e bakmalıyız)
-    """
-    html = await fetch_text(session, series_url)
-    if not html:
-        return {"title": series_slug.replace("-", " ").title(), "poster": ""}
-
-    try:
-        soup = BeautifulSoup(html, 'lxml')
-        
-        # Başlık ve Poster bulma (Site tasarımına göre değişebilir, genel yaklaşımlar)
-        poster_img = soup.find("div", class_="poster").find("img") if soup.find("div", class_="poster") else None
-        
-        if not poster_img:
-            # Alternatif
-            poster_img = soup.select_one("img[src*='file.macellan']")
+            sitemap_urls.append(loc.text.strip())
             
-        poster_url = ""
-        if poster_img:
-            poster_url = poster_img.get("data-src") or poster_img.get("src")
-            # Poster URL düzeltme
-            if poster_url and not poster_url.startswith("http"):
-                 if "macellan" in poster_url:
-                     poster_url = f"https:{poster_url}" if poster_url.startswith("//") else poster_url
-                 else:
-                     poster_url = f"https://file.macellan.online/{poster_url.lstrip('/')}"
-        
-        title_tag = soup.find("h1") or soup.find("title")
-        title = title_tag.get_text(strip=True).replace("İzle", "").strip() if title_tag else series_slug
-        
-        return {"title": title, "poster": poster_url}
-        
-    except:
-        return {"title": series_slug, "poster": ""}
+        # Yöntem B: Eğer tagler yoksa ve text ise (Fallback)
+        if not sitemap_urls:
+            text = soup.get_text()
+            sitemap_urls = re.findall(r'https://.*?sitemap-\d+\.xml', text)
+            
+        # Manuel Fallback (Eğer sitemap index boş görünürse)
+        if not sitemap_urls:
+            print("⚠️ Index okunamadı, manuel liste oluşturuluyor...")
+            sitemap_urls = [f"{base_url}/sitemaps/sitemap-{i}.xml" for i in range(1, 150)]
 
-async def main():
-    global CURRENT_BASE_URL, HEADERS, COOKIES
-    
-    # 1. Domain Bul
-    url, cookies, ua = find_working_domain()
-    if not url:
-        print("❌ HATA: Çalışan domain bulunamadı.")
-        # Boş dosya oluştur
-        with open(OUTPUT_M3U, 'w') as f: f.write("#EXTM3U\n")
-        return
+        print(f"📄 Toplam {len(sitemap_urls)} alt sitemap bulundu.")
+
+        # 3. Alt Sitemapleri Gez ve Linkleri Topla
+        all_links = []
+        print("🌍 Linkler toplanıyor (Selenium ile)...")
         
-    CURRENT_BASE_URL = url.rstrip("/")
-    HEADERS = {"User-Agent": ua}
-    COOKIES = cookies
-    
-    # SSL yoksay
-    connector = aiohttp.TCPConnector(ssl=False)
-    
-    async with aiohttp.ClientSession(connector=connector, cookies=COOKIES, headers=HEADERS) as session:
-        
-        # 2. Ana Sitemap'i Çek
-        print("🗺️ Sitemap Index indiriliyor...")
-        sitemap_index_url = f"{CURRENT_BASE_URL}/sitemaps/sitemap-index.xml"
-        sitemap_files = await parse_sitemap(session, sitemap_index_url)
-        
-        if not sitemap_files:
-            # Fallback: Bazen sitemap-index yoktur, manuel deneriz
-            print("⚠️ Sitemap Index boş, manuel liste oluşturuluyor...")
-            sitemap_files = [f"{CURRENT_BASE_URL}/sitemaps/sitemap-{i}.xml" for i in range(1, 193)]
+        # Her bir sitemap dosyasını Selenium ile ziyaret et
+        for sm_url in tqdm(sitemap_urls, desc="Sitemap Okuma"):
+            # Domain değişmiş olabilir, sitemap linkini güncelle
+            if base_url not in sm_url:
+                part = sm_url.split("/sitemaps/")[-1]
+                sm_url = f"{base_url}/sitemaps/{part}"
+                
+            html = get_page_source_via_selenium(sm_url)
+            if not html: continue
             
-        print(f"Toplam {len(sitemap_files)} alt harita bulundu.")
-        
-        # 3. Alt Haritaları Tara (TÜM URL'leri topla)
-        print("🌍 Tüm linkler toplanıyor (Bu işlem hızlıdır)...")
-        tasks = [parse_sitemap(session, sm) for sm in sitemap_files]
-        
-        all_urls = []
-        for f in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc="Link Taraması"):
-            res = await f
-            if res: all_urls.extend(res)
+            sub_soup = BeautifulSoup(html, 'lxml')
             
-        print(f"Toplam {len(all_urls)} adet link bulundu.")
+            # Linkleri bul
+            found = 0
+            # <loc> tagleri
+            for loc in sub_soup.find_all("loc"):
+                link = loc.text.strip()
+                all_links.append(link)
+                found += 1
+            
+            # Eğer tag bulamazsa text regex (Chrome bazen XML'i text gösterir)
+            if found == 0:
+                text_content = sub_soup.get_text()
+                # Link yapısı: https://dizilla40.com/dizi/...
+                matches = re.findall(rf'{base_url}/dizi/[\w-]+(?:/[\w-]+)?', text_content)
+                all_links.extend(matches)
+
+        # Tekilleştir
+        all_links = list(set(all_links))
+        print(f"🔥 Toplam {len(all_links)} benzersiz link bulundu!")
         
-        # 4. Linkleri Analiz Et ve Grupla
-        # URL Yapısı:
-        # Dizi Ana Sayfa: /dizi/lost
-        # Bölüm Sayfası:  /dizi/lost/1-sezon-1-bolum
-        
-        series_db = {} # {slug: {metadata...}}
-        episodes_map = {} # {slug: [episodes...]}
-        
-        # Regex ile URL parçala
-        # Örnek: .../dizi/lost/1-sezon-1-bolum
-        ep_pattern = re.compile(r'/dizi/([\w-]+)/(\d+)-sezon-(\d+)-bolum')
-        series_pattern = re.compile(r'/dizi/([\w-]+)$')
+        # 4. Veriyi İşle ve M3U Oluştur
+        series_map = {}   # {slug: {title, poster, url}}
+        episodes_list = [] # [{slug, season, episode, url}]
         
         print("Linkler analiz ediliyor...")
-        for link in all_urls:
-            # Önce domaini güncel olanla değiştirelim (Eski sitemap'te eski domain olabilir)
-            if "http" in link:
+        
+        # Regexler
+        # /dizi/lost
+        # /dizi/lost/1-sezon-1-bolum
+        reg_ep = re.compile(r'/dizi/([\w-]+)/(\d+)-sezon-(\d+)-bolum')
+        reg_series = re.compile(r'/dizi/([\w-]+)$')
+        
+        for link in all_links:
+            # URL düzelt
+            if not link.startswith("http"):
+                link = f"{base_url}{link}"
+            # Domain fix
+            if base_url not in link:
                 path = link.split("/", 3)[-1]
-                full_link = f"{CURRENT_BASE_URL}/{path}"
-            else:
-                full_link = f"{CURRENT_BASE_URL}{link}"
-            
-            # Bölüm Kontrolü
-            ep_match = ep_pattern.search(full_link)
+                link = f"{base_url}/{path}"
+                
+            # Bölüm mü?
+            ep_match = reg_ep.search(link)
             if ep_match:
-                slug, season, episode = ep_match.groups()
-                if slug not in episodes_map: episodes_map[slug] = []
-                
-                episodes_map[slug].append({
-                    "season": int(season),
-                    "episode": int(episode),
-                    "url": full_link
+                slug, sea, ep = ep_match.groups()
+                episodes_list.append({
+                    "slug": slug,
+                    "season": int(sea),
+                    "episode": int(ep),
+                    "url": link
                 })
-                # Eğer diziyi henüz db'ye eklemediysek, iskeletini oluştur
-                if slug not in series_db:
-                    series_db[slug] = {"url": f"{CURRENT_BASE_URL}/dizi/{slug}", "fetched": False}
+                # Diziyi haritaya ekle (henüz yoksa)
+                if slug not in series_map:
+                    title = slug.replace("-", " ").title()
+                    # Varsayılan poster (Macellan sunucusu tahmini)
+                    poster = f"https://file.macellan.online/images/{slug.replace('-','')}1.jpg"
+                    series_map[slug] = {"title": title, "poster": poster}
                 continue
-
-            # Dizi Ana Sayfa Kontrolü
-            series_match = series_pattern.search(full_link)
-            if series_match:
-                slug = series_match.group(1)
-                if slug not in series_db:
-                    series_db[slug] = {"url": full_link, "fetched": False}
-        
-        print(f"Toplam {len(series_db)} dizi ve binlerce bölüm tespit edildi.")
-
-        # 5. Dizi Metadata'sını Çek (Poster ve Başlık İçin)
-        # Her bölüm için sayfaya gitmek yerine, sadece Dizi Ana Sayfasına gidip bilgiyi alacağız.
-        # Bu çok daha hızlıdır.
-        
-        # DB yükle (varsa)
-        if os.path.exists(CACHE_FILE):
-            try:
-                with open(CACHE_FILE, "r", encoding="utf-8") as f:
-                    saved_db = json.load(f)
-                    # Var olan verileri koru
-                    for k, v in saved_db.items():
-                        if k in series_db and v.get("poster"):
-                            series_db[k]["title"] = v["title"]
-                            series_db[k]["poster"] = v["poster"]
-                            series_db[k]["fetched"] = True
-            except: pass
-
-        # Metadata'sı eksik olanları tara
-        missing_meta = [k for k, v in series_db.items() if not v.get("fetched")]
-        
-        if missing_meta:
-            print(f"{len(missing_meta)} yeni dizi için poster/başlık indiriliyor...")
-            meta_tasks = []
-            for slug in missing_meta:
-                meta_tasks.append(get_series_metadata(session, slug, series_db[slug]["url"]))
                 
-            # Chunking (20'şerli gruplar halinde)
-            chunk_size = 20
-            results = []
-            
-            # Metadata işlemini tqdm ile gösterelim
-            for i in range(0, len(missing_meta), chunk_size):
-                chunk_slugs = missing_meta[i:i+chunk_size]
-                chunk_tasks = [get_series_metadata(session, s, series_db[s]["url"]) for s in chunk_slugs]
-                
-                chunk_results = await asyncio.gather(*chunk_tasks)
-                
-                # Sonuçları işle
-                for idx, meta in enumerate(chunk_results):
-                    slug = chunk_slugs[idx]
-                    series_db[slug].update(meta)
-                    series_db[slug]["fetched"] = True
-                
-                print(f"Metadata: {i + len(chunk_results)} / {len(missing_meta)} işlendi...", end="\r")
+            # Dizi Ana Sayfası mı?
+            ser_match = reg_series.search(link)
+            if ser_match:
+                slug = ser_match.group(1)
+                title = slug.replace("-", " ").title()
+                # Burada gerçek posteri almak için sayfaya girmek gerekir
+                # Ama hız için şimdilik varsayılan bırakıyoruz.
+                # İstersen buraya bir Selenium 'get' ekleyebiliriz ama 3000 dizi uzun sürer.
+                if slug not in series_map:
+                    poster = f"https://file.macellan.online/images/{slug.replace('-','')}1.jpg"
+                    series_map[slug] = {"title": title, "poster": poster}
 
-            print("\nMetadata işlemi tamamlandı.")
+        print(f"Tespit edilen: {len(series_map)} Dizi, {len(episodes_list)} Bölüm.")
 
-        # 6. Verileri Birleştir ve M3U Yaz
-        print("M3U dosyası oluşturuluyor...")
-        
-        # Cache'i güncelle
-        with open(CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump(series_db, f, ensure_ascii=False, indent=2)
-            
+        # 5. M3U Yaz
+        print("💾 M3U Dosyası kaydediliyor...")
         with open(OUTPUT_M3U, "w", encoding="utf-8") as f:
             f.write("#EXTM3U\n")
             
-            # Dizileri alfabetik sırala
-            sorted_slugs = sorted(series_db.keys())
+            # Bölümleri sırala
+            episodes_list.sort(key=lambda x: (x["slug"], x["season"], x["episode"]))
             
-            for slug in sorted_slugs:
-                if slug not in episodes_map: continue
+            for ep in episodes_list:
+                slug = ep["slug"]
+                info = series_map.get(slug, {"title": slug, "poster": ""})
                 
-                meta = series_db[slug]
-                episodes = episodes_map[slug]
+                full_title = f"{info['title']} - S{ep['season']} B{ep['episode']}"
+                poster = info['poster']
                 
-                # Bölümleri numaraya göre sırala (Sezon -> Bölüm)
-                episodes.sort(key=lambda x: (x["season"], x["episode"]))
-                
-                for ep in episodes:
-                    # M3U Formatı
-                    full_title = f"{meta.get('title', slug)} - S{ep['season']} B{ep['episode']}"
-                    poster = meta.get("poster", "")
-                    # Kategori (Dizilla sitemapinde kategori yok, genel Dizi diyoruz)
-                    category = "Dizilla Dizileri"
-                    
-                    f.write(f'#EXTINF:-1 group-title="{category}" tvg-logo="{poster}", {full_title}\n')
-                    f.write(f"{ep['url']}\n")
+                f.write(f'#EXTINF:-1 group-title="Dizilla" tvg-logo="{poster}", {full_title}\n')
+                f.write(f"{ep['url']}\n")
 
-    print(f"✅ İŞLEM TAMAMLANDI! {OUTPUT_M3U} oluşturuldu.")
+        print("✅ İŞLEM BAŞARIYLA TAMAMLANDI!")
+
+    except Exception as e:
+        print(f"Beklenmeyen hata: {e}")
+    finally:
+        if DRIVER:
+            DRIVER.quit()
 
 if __name__ == "__main__":
-    if sys.platform == 'win32':
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    asyncio.run(main())
+    main()
