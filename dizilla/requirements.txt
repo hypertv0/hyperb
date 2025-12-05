@@ -1,8 +1,8 @@
 aiohttp
 aiodns
 cchardet
-pycryptodome
 beautifulsoup4
 tqdm
 selenium
 webdriver-manager
+lxml
