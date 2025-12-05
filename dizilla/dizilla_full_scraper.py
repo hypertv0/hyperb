@@ -5,7 +5,7 @@ import time
 import re
 from tqdm import tqdm
 
-# Selenium Kütüphaneleri
+# Selenium
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
@@ -21,77 +21,93 @@ CACHE_FILE = "dizilla_db.json"
 DRIVER = None
 
 def setup_driver():
-    """Optimize edilmiş Hızlı Chrome Ayarları"""
+    """Chrome Ayarları - Maksimum Uyumluluk"""
     options = Options()
-    options.add_argument("--headless") # Ekransız mod
+    options.add_argument("--headless") 
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
+    # Sayfa yüklenmesini bekleme stratejisi: 'eager' (HTML yüklensin yeter, resimleri bekleme)
+    options.page_load_strategy = 'eager'
     
-    # Resimleri ve gereksiz şeyleri yükleme (Hız için kritik)
-    prefs = {
-        "profile.managed_default_content_settings.images": 2,
-        "profile.default_content_setting_values.notifications": 2,
-        "profile.managed_default_content_settings.stylesheets": 2,
-        "profile.managed_default_content_settings.cookies": 2,
-        "profile.managed_default_content_settings.javascript": 1,
-        "profile.managed_default_content_settings.plugins": 2,
-        "profile.managed_default_content_settings.popups": 2,
-        "profile.managed_default_content_settings.geolocation": 2,
-        "profile.managed_default_content_settings.media_stream": 2,
-    }
-    options.add_experimental_option("prefs", prefs)
-    
-    # Bot olduğumuzu gizle
-    options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
+    options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
     
     service = Service(ChromeDriverManager().install())
     driver = webdriver.Chrome(service=service, options=options)
-    driver.set_page_load_timeout(30)
     return driver
 
 def find_working_domain():
-    """Çalışan domaini bulur (39-60 arası)"""
+    """Çalışan domaini tespit et"""
     print("🤖 Domain tespiti yapılıyor (Chrome)...")
-    
     for i in range(START_DOMAIN_NUM, END_DOMAIN_NUM):
         url = f"https://dizilla{i}.com"
         try:
             DRIVER.get(url)
-            # Sayfa başlığını kontrol et
+            time.sleep(2)
             if "dizilla" in DRIVER.title.lower():
-                print(f"✅ AKTİF DOMAIN: {url}")
+                print(f"✅ AKTİF DOMAIN BULUNDU: {url}")
                 return url
         except:
             pass
     return None
 
-def get_links_from_source(source_text, base_url):
+def extract_episode_links(page_content, base_url):
     """
-    Sayfa kaynağındaki (XML/HTML fark etmez) tüm dizi linklerini Regex ile bulur.
-    Format: base_url/dizi-adi-1-sezon-1-bolum
+    Sayfa içeriğindeki (HTML/XML/Text) TÜM metinden linkleri ayıklar.
+    Regex kullanmaz, kaba kuvvet ile string analizi yapar.
     """
-    # Regex: base_url/ slug - sezon - bolum
+    found_links = set()
+    
+    # 1. İçerikteki tüm "http" ile başlayan kelimeleri bul
+    # Bu regex, boşluk veya tırnak görene kadar olan her şeyi url sanar.
+    raw_urls = re.findall(r'https?://[^\s<>"\'()]+', page_content)
+    
+    base_clean = base_url.replace("https://", "").replace("http://", "")
+    
+    for url in raw_urls:
+        # URL temizliği (XML tagleri yapışmış olabilir)
+        url = url.split("<")[0].split(">")[0]
+        
+        # Sadece bizim domaini ve bölüm linklerini al
+        # Kriter: "dizilla" geçecek, "-sezon-" geçecek, "-bolum" geçecek.
+        if base_clean in url and "-sezon-" in url and "-bolum" in url:
+            found_links.add(url)
+            
+    return list(found_links)
+
+def parse_url_info(url):
+    """URL'den Dizi Adı, Sezon ve Bölüm bilgisini çıkarır"""
     # Örnek: https://dizilla40.com/miss-fallaci-1-sezon-7-bolum
+    try:
+        # Son kısmı al: miss-fallaci-1-sezon-7-bolum
+        slug_part = url.rstrip("/").split("/")[-1]
+        
+        # Regex ile parçala
+        match = re.search(r'^(.*?)-(\d+)-sezon-(\d+)-bolum', slug_part)
+        if match:
+            name_slug = match.group(1)
+            season = int(match.group(2))
+            episode = int(match.group(3))
+            
+            title = name_slug.replace("-", " ").title()
+            return title, season, episode, name_slug
+    except:
+        pass
     
-    clean_base = base_url.replace("https://", "").replace("http://", "")
-    
-    # Pattern: Link içinde "sezon" ve "bolum" kelimeleri geçmeli
-    pattern = r'https?://' + re.escape(clean_base) + r'/([\w-]+)-(\d+)-sezon-(\d+)-bolum'
-    
-    links = []
-    matches = re.findall(pattern, source_text)
-    
-    for match in matches:
-        slug, season, episode = match
-        full_url = f"{base_url}/{slug}-{season}-sezon-{episode}-bolum"
-        links.append({
-            "slug": slug,
-            "season": int(season),
-            "episode": int(episode),
-            "url": full_url
-        })
-    return links
+    # Eğer regex tutmazsa manuel parse dene (Fallback)
+    try:
+        parts = url.split("-")
+        # Son eleman 'bolum', ondan önceki '7', ondan önceki 'sezon', ondan önceki '1'
+        if parts[-1] == "bolum" and parts[-3] == "sezon":
+            episode = int(parts[-2])
+            season = int(parts[-4])
+            name_slug = "-".join(parts[:-4]).split("/")[-1]
+            title = name_slug.replace("-", " ").title()
+            return title, season, episode, name_slug
+    except:
+        pass
+
+    return "Bilinmeyen Dizi", 1, 1, "unknown"
 
 def main():
     global DRIVER
@@ -101,102 +117,101 @@ def main():
         # 1. Domain Bul
         base_url = find_working_domain()
         if not base_url:
-            print("❌ Çalışan site bulunamadı! İnternet bağlantısını veya site durumunu kontrol edin.")
-            # Boş dosya oluştur ki workflow hata vermesin
+            print("❌ Hata: Çalışan site bulunamadı.")
             with open(OUTPUT_M3U, "w") as f: f.write("#EXTM3U\n")
-            with open(CACHE_FILE, "w") as f: f.write("{}")
             return
 
-        # 2. Sitemap Listesini Oluştur
-        # Manuel liste oluşturuyoruz çünkü sitemap index okumak bazen sorun yaratıyor.
-        # Genelde sitemap-1'den sitemap-200'e kadar gider.
-        # Sitede 192 tane olduğunu loglardan gördük.
-        print("🗺️ Sitemap listesi hazırlanıyor...")
+        # 2. Sitemap Listesi (Manuel Garanti Liste)
+        # Sitede 192 tane olduğunu biliyoruz, 200'e kadar tarayalım.
         sitemap_urls = [f"{base_url}/sitemaps/sitemap-{i}.xml" for i in range(1, 201)]
-
-        # 3. Tüm Linkleri Topla
-        all_episodes = []
-        print(f"🌍 {len(sitemap_urls)} adet site haritası taranıyor...")
         
-        for sm_url in tqdm(sitemap_urls, desc="Tarama"):
+        print(f"🌍 {len(sitemap_urls)} adet site haritası taranacak...")
+        
+        all_episodes_data = [] # [{title, season, episode, url, slug}]
+        
+        # İlerleme çubuğu ile tarama
+        pbar = tqdm(sitemap_urls, desc="Veri Çekiliyor")
+        for sm_url in pbar:
             try:
                 DRIVER.get(sm_url)
-                page_source = DRIVER.page_source
                 
-                # Eğer sayfa boşsa veya hata varsa atla
-                if "404" in DRIVER.title:
+                # Sayfa kaynağını al (XML kodları dahil her şey)
+                content = DRIVER.page_source
+                
+                # Eğer sayfa 404 ise veya boşsa geç
+                if "404" in DRIVER.title or len(content) < 100:
                     continue
                 
-                # Regex ile linkleri sök
-                extracted = get_links_from_source(page_source, base_url)
-                if extracted:
-                    all_episodes.extend(extracted)
-                    
-            except Exception as e:
-                # Bir sitemap hatası tüm işlemi durdurmasın
+                # Linkleri ayıkla
+                links = extract_episode_links(content, base_url)
+                
+                for link in links:
+                    title, sea, ep, slug = parse_url_info(link)
+                    all_episodes_data.append({
+                        "title": title,
+                        "season": sea,
+                        "episode": ep,
+                        "url": link,
+                        "slug": slug
+                    })
+                
+                # İlerleme çubuğuna bilgi ver
+                pbar.set_postfix({"Bulunan": len(all_episodes_data)})
+                
+            except Exception:
                 continue
 
-        # Tekilleştirme (Aynı bölüm birden fazla sitemapte olabilir)
-        # URL'ye göre benzersiz yap
-        unique_episodes = {e['url']: e for e in all_episodes}.values()
-        unique_episodes = list(unique_episodes)
+        # 3. Tekilleştirme ve Sıralama
+        # Aynı linkten birden fazla olabilir, temizleyelim
+        unique_db = {}
+        for item in all_episodes_data:
+            unique_db[item['url']] = item
+            
+        final_list = list(unique_db.values())
+        print(f"\n🔥 Toplam {len(final_list)} benzersiz bölüm bulundu!")
         
-        print(f"🔥 Toplam {len(unique_episodes)} bölüm linki bulundu!")
-        
-        # 4. Verileri Grupla
-        series_map = {} # {slug: {title, poster, episodes: []}}
-        
-        for ep in unique_episodes:
-            slug = ep['slug']
-            if slug not in series_map:
-                # Başlığı slug'dan üret (Miss-fallaci -> Miss Fallaci)
-                title = slug.replace("-", " ").title()
-                # Poster URL'sini tahmin et (Macellan CDN yapısı)
-                # Tam doğru olmasa da logoda resim görünür
+        # 4. Verileri Düzenle (Diziye göre grupla)
+        # Poster ataması yapalım (Tahmini)
+        series_groups = {}
+        for item in final_list:
+            slug = item['slug']
+            if slug not in series_groups:
+                # Poster URL tahmini (Macellan CDN)
                 poster = f"https://file.macellan.online/images/tv/poster/f/f/100/{slug.replace('-','')}.jpg"
-                
-                series_map[slug] = {
-                    "title": title,
+                series_groups[slug] = {
+                    "title": item['title'],
                     "poster": poster,
                     "episodes": []
                 }
-            
-            series_map[slug]["episodes"].append(ep)
+            series_groups[slug]["episodes"].append(item)
 
-        # 5. M3U Oluştur ve Kaydet
-        print("💾 M3U Dosyası yazılıyor...")
-        
+        # 5. M3U Dosyasını Yaz
+        print("💾 M3U Dosyası oluşturuluyor...")
         with open(OUTPUT_M3U, "w", encoding="utf-8") as f:
             f.write("#EXTM3U\n")
             
-            # Dizileri isme göre sırala
-            sorted_slugs = sorted(series_map.keys())
-            
-            for slug in sorted_slugs:
-                data = series_map[slug]
-                # Bölümleri sırala: Sezon -> Bölüm
-                data["episodes"].sort(key=lambda x: (x["season"], x["episode"]))
+            # Dizileri alfabetik sırala
+            for slug in sorted(series_groups.keys()):
+                series = series_groups[slug]
                 
-                for ep in data["episodes"]:
-                    full_title = f"{data['title']} - S{ep['season']} B{ep['episode']}"
+                # Bölümleri sırala (Sezon -> Bölüm)
+                episodes = sorted(series["episodes"], key=lambda x: (x['season'], x['episode']))
+                
+                for ep in episodes:
+                    full_title = f"{ep['title']} - S{ep['season']} B{ep['episode']}"
                     
-                    # M3U Formatı
-                    # #EXTINF:-1 group-title="Dizi Adı" tvg-logo="...", Dizi Adı - S1 B1
-                    # Link
-                    
-                    f.write(f'#EXTINF:-1 group-title="{data["title"]}" tvg-logo="{data["poster"]}", {full_title}\n')
+                    # M3U Entry
+                    f.write(f'#EXTINF:-1 group-title="Dizilla" tvg-logo="{series["poster"]}", {full_title}\n')
                     f.write(f"{ep['url']}\n")
         
-        # JSON Veritabanını da güncelle (Yedek olarak)
+        # JSON Yedeği
         with open(CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump(series_map, f, ensure_ascii=False, indent=2)
+            json.dump(series_groups, f, ensure_ascii=False, indent=2)
 
-        print(f"✅ İŞLEM BAŞARIYLA TAMAMLANDI! {len(unique_episodes)} bölüm eklendi.")
+        print("✅ İŞLEM TAMAMLANDI! İyi seyirler.")
 
     except Exception as e:
-        print(f"Beklenmeyen genel hata: {e}")
-        # Hata durumunda boş dosya oluştur
-        if not os.path.exists(OUTPUT_M3U): open(OUTPUT_M3U, 'w').close()
+        print(f"Kritik Hata: {e}")
     finally:
         if DRIVER:
             DRIVER.quit()
