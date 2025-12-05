@@ -2,8 +2,9 @@ name: Dizilla Botu
 
 on:
   schedule:
+    # Türkiye Saati ile 12:30'da çalışır (UTC 09:30)
     - cron: '30 9 * * *'
-  workflow_dispatch:
+  workflow_dispatch: # Manuel çalıştırma butonu
 
 permissions:
   contents: write
@@ -11,33 +12,42 @@ permissions:
 jobs:
   scrape_dizilla:
     runs-on: ubuntu-latest
-    timeout-minutes: 350
+    # İşlem Selenium ve detaylı tarama içerdiği için 6 saat süre tanıyalım
+    timeout-minutes: 360
 
     steps:
-    - name: Depoyu Çek
+    - name: Depoyu Çek (Checkout)
       uses: actions/checkout@v4
 
-    - name: Python Kurulumu
+    - name: Python Kurulumu (3.10)
       uses: actions/setup-python@v5
       with:
         python-version: '3.10'
 
+    - name: Chrome Tarayıcı Kontrolü
+      # GitHub runner'larında Chrome yüklüdür, sürümü loga yazdıralım
+      run: google-chrome --version
+
     - name: Kütüphaneleri Yükle
+      # Selenium, aiohttp ve diğer gereksinimleri yükler
       run: |
         pip install --upgrade pip
         pip install -r dizilla/requirements.txt
 
     - name: Dizilla Scriptini Çalıştır
+      # Selenium (Headless Chrome) ile domaini bulur ve aiohttp ile tarar
       run: python dizilla/dizilla_full_scraper.py
 
-    - name: Sonuçları Kaydet
+    - name: Sonuçları Kaydet (Commit & Push)
       run: |
         git config --global user.name "DizillaBot"
         git config --global user.email "bot@dizilla.com"
         
-        # Dosyaları ekle (eğer varsa)
+        # veritabanı ve m3u dosyasını ekle (Hata almamak için || true kullanıyoruz)
         git add dizilla_db.json dizilla_archive.m3u || true
         
-        # Değişiklik varsa commit at, yoksa hata verme
-        git commit -m "Dizilla Güncellemesi: $(date)" || echo "Değişiklik yok, commit atlanıyor."
+        # Değişiklik varsa commit at, yoksa "Değişiklik yok" yazıp geç
+        git commit -m "Dizilla Arşivi Güncellendi: $(date)" || echo "Değişiklik yok, commit atlanıyor."
+        
+        # Değişiklikleri repoya gönder
         git push
