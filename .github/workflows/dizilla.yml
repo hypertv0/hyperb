@@ -13,30 +13,34 @@ jobs:
       - name: Depoyu Çek
         uses: actions/checkout@v3
 
-      # --- İŞTE SİHİRLİ DOKUNUŞ: CLOUDFLARE WARP ---
-      - name: Cloudflare WARP Kurulumu
-        uses: fscarmen/warp-on-actions@v1.1
-        with:
-          stack: dual # Hem IPv4 hem IPv6 desteği
-
       - name: Python Kurulumu
         uses: actions/setup-python@v4
         with:
-          python-version: '3.9'
+          python-version: '3.10'
 
+      # --- SANAL EKRAN VE CHROME KURULUMU ---
+      - name: Chrome ve Xvfb Kurulumu
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y google-chrome-stable xvfb
+          
       - name: Kütüphaneleri Yükle
         run: |
           pip install -r dizilla/requirements.txt
+          # SeleniumBase için gerekli driverları indir
+          sbase install chromedriver
 
-      - name: Scripti Çalıştır
+      # --- SCRIPTI SANAL EKRANDA ÇALIŞTIR ---
+      - name: Scripti Çalıştır (Xvfb ile)
         run: |
           cd dizilla
-          python main.py
+          # Sanal ekranı başlat ve scripti içine at
+          xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24" python main.py
 
       - name: Değişiklikleri Kaydet
         run: |
           git config --global user.name "GitHub Action"
           git config --global user.email "action@github.com"
           git add dizilla/dizilla.m3u
-          git commit -m "Dizilla M3U Güncellendi (WARP) - $(date)" || echo "Değişiklik yok"
+          git commit -m "Dizilla M3U Güncellendi (SeleniumBase) - $(date)" || echo "Değişiklik yok"
           git push
