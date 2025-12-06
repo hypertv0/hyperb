@@ -18,7 +18,7 @@ jobs:
         with:
           python-version: '3.10'
 
-      # --- SANAL EKRAN VE CHROME KURULUMU ---
+      # --- CHROME VE XVFB KURULUMU ---
       - name: Chrome ve Xvfb Kurulumu
         run: |
           sudo apt-get update
@@ -27,8 +27,6 @@ jobs:
       - name: Kütüphaneleri Yükle
         run: |
           pip install -r dizilla/requirements.txt
-          # SeleniumBase için gerekli driverları indir
-          sbase install chromedriver
 
       # --- SCRIPTI SANAL EKRANDA ÇALIŞTIR ---
       - name: Scripti Çalıştır (Xvfb ile)
@@ -37,10 +35,16 @@ jobs:
           # Sanal ekranı başlat ve scripti içine at
           xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24" python main.py
 
+      # --- HATA ALMAMAK İÇİN KONTROLLÜ COMMIT ---
       - name: Değişiklikleri Kaydet
         run: |
           git config --global user.name "GitHub Action"
           git config --global user.email "action@github.com"
-          git add dizilla/dizilla.m3u
-          git commit -m "Dizilla M3U Güncellendi (SeleniumBase) - $(date)" || echo "Değişiklik yok"
-          git push
+          # Dosya varsa ekle, yoksa hata verme
+          if [ -f dizilla/dizilla.m3u ]; then
+            git add dizilla/dizilla.m3u
+            git commit -m "Dizilla M3U Güncellendi (DrissionPage) - $(date)" || echo "Değişiklik yok"
+            git push
+          else
+            echo "M3U dosyası oluşturulamadı, commit atlanıyor."
+          fi
