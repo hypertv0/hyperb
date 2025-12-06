@@ -30,7 +30,6 @@ jobs:
       - name: Scripti Çalıştır (Xvfb ile)
         run: |
           cd dizilla
-          # Sanal ekranı başlat ve scripti içine at
           xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24" python main.py
 
       - name: Değişiklikleri Kaydet
@@ -39,7 +38,7 @@ jobs:
           git config --global user.email "action@github.com"
           if [ -f dizilla/dizilla.m3u ]; then
             git add dizilla/dizilla.m3u
-            git commit -m "DiziBox M3U Güncellendi - $(date)" || echo "Değişiklik yok"
+            git commit -m "DiziBox M3U Güncellendi (Google Proxy) - $(date)" || echo "Değişiklik yok"
             git push
           else
             echo "M3U dosyası yok."
