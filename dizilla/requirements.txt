@@ -1,4 +1,3 @@
-requests
+curl_cffi
 pycryptodome
 beautifulsoup4
-cloudscraper
