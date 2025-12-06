@@ -18,7 +18,6 @@ jobs:
         with:
           python-version: '3.10'
 
-      # --- CHROME VE XVFB KURULUMU ---
       - name: Chrome ve Xvfb Kurulumu
         run: |
           sudo apt-get update
@@ -28,23 +27,19 @@ jobs:
         run: |
           pip install -r dizilla/requirements.txt
 
-      # --- SCRIPTI SANAL EKRANDA ÇALIŞTIR ---
       - name: Scripti Çalıştır (Xvfb ile)
         run: |
           cd dizilla
-          # Sanal ekranı başlat ve scripti içine at
           xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24" python main.py
 
-      # --- HATA ALMAMAK İÇİN KONTROLLÜ COMMIT ---
       - name: Değişiklikleri Kaydet
         run: |
           git config --global user.name "GitHub Action"
           git config --global user.email "action@github.com"
-          # Dosya varsa ekle, yoksa hata verme
           if [ -f dizilla/dizilla.m3u ]; then
             git add dizilla/dizilla.m3u
-            git commit -m "Dizilla M3U Güncellendi (DrissionPage) - $(date)" || echo "Değişiklik yok"
+            git commit -m "Dizilla M3U Güncellendi (Google Proxy) - $(date)" || echo "Değişiklik yok"
             git push
           else
-            echo "M3U dosyası oluşturulamadı, commit atlanıyor."
+            echo "M3U dosyası yok."
           fi
