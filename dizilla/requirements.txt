@@ -1,3 +1,4 @@
-selenium
-webdriver-manager
-tqdm
+requests
+pycryptodome
+beautifulsoup4
+cloudscraper
