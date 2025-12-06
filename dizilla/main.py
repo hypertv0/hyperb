@@ -3,6 +3,7 @@ import base64
 import time
 import re
 import sys
+import urllib.parse
 from datetime import datetime
 from DrissionPage import ChromiumPage, ChromiumOptions
 from Crypto.Cipher import AES
@@ -10,7 +11,11 @@ from Crypto.Util.Padding import unpad
 from bs4 import BeautifulSoup
 
 # --- AYARLAR ---
-BASE_URL = "https://dizilla40.com"
+REAL_BASE_URL = "https://dizilla40.com"
+# Google Translate Proxy URL'si (Türkçe -> Türkçe çeviri yaparak siteyi olduğu gibi gösterir)
+PROXY_BASE_URL = "https://dizilla40-com.translate.goog"
+PROXY_PARAMS = "?_x_tr_sl=tr&_x_tr_tl=tr&_x_tr_hl=tr&_x_tr_pto=wapp"
+
 AES_KEY = b"9bYMCNQiWsXIYFWYAu7EkdsSbmGBTyUI"
 AES_IV = bytes([0] * 16)
 OUTPUT_FILE = "dizilla.m3u"
@@ -29,16 +34,30 @@ def decrypt_dizilla_response(encrypted_data):
     except:
         return None
 
+def get_translate_url(original_url):
+    """Normal URL'i Google Translate URL'ine çevirir"""
+    if "translate.goog" in original_url:
+        return original_url
+    
+    # https://dizilla40.com/dizi/x -> https://dizilla40-com.translate.goog/dizi/x?...
+    path = original_url.replace(REAL_BASE_URL, "")
+    return f"{PROXY_BASE_URL}{path}{PROXY_PARAMS}"
+
 def extract_contentx(page, url):
     try:
+        # ContentX URL'ini de Google Translate üzerinden açmayı dene
+        # Ancak ContentX iframe olduğu için bazen direkt erişim gerekebilir.
+        # Önce direkt deneyelim (ContentX genelde IP banlamaz), olmazsa Translate deneriz.
+        
         tab = page.new_tab(url)
-        time.sleep(4) # Yüklenmesi için bekle
+        time.sleep(4)
         
         html = tab.html
         match = re.search(r"window\.openPlayer\('([^']+)'", html)
         
         if match:
             extract_id = match.group(1)
+            # Source2.php
             source_url = f"https://contentx.me/source2.php?v={extract_id}"
             tab.get(source_url)
             time.sleep(2)
@@ -59,22 +78,41 @@ def extract_contentx(page, url):
 
 def process_episode(page, episode_url):
     try:
-        page.get(episode_url)
-        time.sleep(2)
+        # Google Translate üzerinden git
+        safe_url = get_translate_url(episode_url)
+        log(f"Google üzerinden gidiliyor: {safe_url}", "DEBUG")
         
-        # Cloudflare kontrolü
-        if "Just a moment" in page.title:
-            log("Bölüm sayfasında Cloudflare çıktı, bekleniyor...", "WARNING")
-            time.sleep(5)
-
-        # __NEXT_DATA__ scriptini çek
+        page.get(safe_url)
+        time.sleep(3)
+        
+        # Google Translate bazen iframe içine alır, bazen direkt gösterir.
+        # __NEXT_DATA__ scriptini bulmaya çalışalım.
+        
+        script_text = None
         try:
-            script_text = page.ele("#__NEXT_DATA__", timeout=5).text
+            # Google Translate header'ını geçip içeriğe odaklan
+            # Bazen script tagleri bozulabilir, text olarak arayalım
+            html = page.html
+            start_marker = '<script id="__NEXT_DATA__" type="application/json">'
+            end_marker = '</script>'
+            
+            if start_marker in html:
+                start_index = html.find(start_marker) + len(start_marker)
+                end_index = html.find(end_marker, start_index)
+                script_text = html[start_index:end_index]
         except:
-            log("Sayfada __NEXT_DATA__ bulunamadı.", "ERROR")
-            return None
+            pass
 
-        if not script_text: return None
+        if not script_text:
+            # Element olarak dene
+            try:
+                script_text = page.ele("#__NEXT_DATA__").text
+            except:
+                pass
+
+        if not script_text:
+            log("Sayfada __NEXT_DATA__ bulunamadı (Google Translate bozmuş olabilir).", "ERROR")
+            return None
         
         data = json.loads(script_text)
         secure_data = data.get("props", {}).get("pageProps", {}).get("secureData", "")
@@ -107,104 +145,102 @@ def main():
     co = ChromiumOptions()
     co.set_argument('--no-sandbox')
     co.set_argument('--disable-gpu')
-    # Headless KAPALI (Xvfb ile çalışacak)
+    # Google Translate çubuğunu gizlemek için
+    co.set_argument('--disable-translate')
     
     page = ChromiumPage(co)
     
     try:
-        log("DrissionPage Başlatıldı.", "INFO")
+        log("DrissionPage (Google Proxy Modu) Başlatıldı.", "INFO")
         
-        url = f"{BASE_URL}/tum-bolumler"
-        page.get(url)
+        # Ana sayfaya Google Translate üzerinden git
+        start_url = f"{PROXY_BASE_URL}/tum-bolumler{PROXY_PARAMS}"
+        log(f"Bağlanılıyor: {start_url}", "INFO")
         
-        # Cloudflare Bekleme
-        for i in range(15):
-            if "Just a moment" in page.title or "Access denied" in page.title:
-                log(f"Cloudflare bekleniyor... ({i+1}/15)", "WARNING")
-                time.sleep(2)
-            else:
-                break
+        page.get(start_url)
         
-        if "Just a moment" in page.title:
-            log("HATA: Cloudflare aşılamadı.", "CRITICAL")
+        # Cloudflare kontrolü (Google üzerinden gittiğimiz için çıkmamalı ama yine de bakalım)
+        time.sleep(5)
+        if "Access denied" in page.title or "Error 1005" in page.html:
+            log("HATA: Google Translate üzerinden bile engellendi!", "CRITICAL")
             page.quit()
             return
 
         log("Ana sayfaya erişildi. İçerik taranıyor...", "SUCCESS")
-        time.sleep(5) # Sayfanın tamamen yüklenmesi (hydration) için bekle
         
-        # --- GENEL TARAMA STRATEJİSİ ---
-        # Belirli bir class aramak yerine, tüm linkleri alıp analiz ediyoruz.
-        # Kotlin koduna göre yapı: <a> -> <h2>(Başlık) + <div>(Bölüm No)
+        # Linkleri topla
+        # Google Translate linkleri değiştirir, onları düzeltmemiz lazım
+        # Linkler genelde şöyle olur: https://dizilla40-com.translate.goog/dizi/...?_x_tr...
         
         all_links = page.eles("tag:a")
-        log(f"Sayfada toplam {len(all_links)} link bulundu. Analiz ediliyor...", "INFO")
+        log(f"Sayfada {len(all_links)} link bulundu.", "INFO")
         
         items = []
         for link in all_links:
             try:
-                # Linkin içine bak
-                link_html = link.html
                 href = link.attr("href")
+                if not href: continue
                 
-                if not href or "/dizi/" not in href:
+                # Linkin dizi linki olup olmadığını kontrol et
+                # Orijinal: /dizi/adi
+                # Translate: https://dizilla40-com.translate.goog/dizi/adi?...
+                
+                if "/dizi/" not in href:
                     continue
                 
-                # HTML parse et
+                # Başlık ve Bölüm bilgisini al
+                # Google Translate HTML yapısını biraz değiştirebilir, esnek olalım
+                link_html = link.html
                 soup = BeautifulSoup(link_html, 'html.parser')
                 
-                # Başlık var mı? (h2 veya h3 olabilir)
-                title_tag = soup.find("h2") or soup.find("h3")
+                title_tag = soup.find("h2") or soup.find("h3") or soup.find("font") # Google bazen font tagi ekler
                 if not title_tag: continue
                 
-                # Bölüm bilgisi var mı? (Genelde opacity class'ı veya metin içinde Sezon/Bölüm geçer)
-                # Kotlin kodu: div.opacity-80
-                ep_tag = soup.select_one("div.opacity-80")
+                text_content = soup.get_text()
+                if "Sezon" not in text_content and "Bölüm" not in text_content:
+                    continue
                 
-                # Eğer opacity div yoksa, metin içeriğine bak
-                if not ep_tag:
-                    text_content = soup.get_text()
-                    if "Sezon" not in text_content and "Bölüm" not in text_content:
-                        continue
-                    ep_info = text_content # Fallback
-                else:
-                    ep_info = ep_tag.text.strip()
-
                 title = title_tag.text.strip()
+                # Bölüm bilgisini metinden ayıkla (Regex ile)
+                # Örnek: "Dizi Adı 2. Sezon 5. Bölüm"
                 
-                # Temizleme
-                ep_clean = ep_info.replace(". Sezon ", "x").replace(". Bölüm", "").strip()
-                # Eğer ep_clean çok uzunsa (yanlış veri), başlığı kullanma
-                if len(ep_clean) > 20: continue 
-
-                full_title = f"{title} - {ep_clean}"
-                full_url = f"{BASE_URL}{href}"
+                ep_match = re.search(r"(\d+)\.\s*Sezon\s*(\d+)\.\s*Bölüm", text_content)
+                if ep_match:
+                    ep_info = f"{ep_match.group(1)}x{ep_match.group(2)}"
+                else:
+                    # Fallback
+                    ep_info = text_content.split("Sezon")[-1].strip()
                 
-                # Tekrar eklemeyi önle
-                if not any(d['url'] == full_url for d in items):
-                    items.append({"title": full_title, "url": full_url, "category": "Yeni"})
+                full_title = f"{title} - {ep_info}"
+                
+                # URL'i temizle (Google parametrelerini temizleyip orijinal domaini koyalım ki işlememiz kolay olsun)
+                # Ama process_episode fonksiyonu zaten translate'e çevirecek.
+                # Biz direkt translate linkini saklayalım ama temizleyelim.
+                
+                # Basitçe: Eğer link translate.goog içeriyorsa geçerlidir.
+                
+                # Tekrar kontrolü
+                if not any(d['title'] == full_title for d in items):
+                    items.append({"title": full_title, "url": href, "category": "Yeni"})
                     log(f"Bulundu: {full_title}", "DEBUG")
-                    
-                if len(items) >= 20: break # 20 tane yeter
+                
+                if len(items) >= 20: break
                 
             except Exception as e:
                 continue
 
-        if len(items) == 0:
-            log("HİÇ İÇERİK BULUNAMADI! Sayfa yapısı debug ediliyor...", "CRITICAL")
-            # Sayfanın HTML'ini loglara bas (ilk 2000 karakter)
-            html_dump = page.html
-            log(f"HTML DUMP (İlk 2000 karakter):\n{html_dump[:2000]}", "DEBUG")
+        if not items:
+            log("İçerik bulunamadı. HTML yapısı değişmiş olabilir.", "WARNING")
+            # log(page.html[:1000], "DEBUG")
         else:
-            log(f"{len(items)} adet geçerli bölüm bulundu. Linkler çözülüyor...", "INFO")
-        
-        # 3. M3U Oluştur
-        if items:
+            log(f"{len(items)} içerik işleniyor...", "INFO")
+            
             with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
                 f.write("#EXTM3U\n")
                 
                 for item in items:
                     log(f"İşleniyor: {item['title']}", "INFO")
+                    # URL zaten Google Translate URL'i olabilir, process_episode bunu halleder
                     stream_url = process_episode(page, item["url"])
                     
                     if stream_url:
