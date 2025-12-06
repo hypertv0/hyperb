@@ -38,7 +38,7 @@ jobs:
           git config --global user.email "action@github.com"
           if [ -f dizilla/dizilla.m3u ]; then
             git add dizilla/dizilla.m3u
-            git commit -m "DiziBox M3U Güncellendi (Sitemap) - $(date)" || echo "Değişiklik yok"
+            git commit -m "DiziBox M3U Güncellendi (RSS/Cache) - $(date)" || echo "Değişiklik yok"
             git push
           else
             echo "M3U dosyası yok."
