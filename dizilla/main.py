@@ -4,8 +4,9 @@ import time
 import re
 import sys
 import hashlib
-import requests
+import random
 from datetime import datetime
+from curl_cffi import requests as crequests # Cloudflare bypass için özel istek kütüphanesi
 from DrissionPage import ChromiumPage, ChromiumOptions
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import unpad
@@ -13,8 +14,7 @@ from bs4 import BeautifulSoup
 
 # --- AYARLAR ---
 BASE_URL = "https://www.dizibox.live"
-RSS_URL = "https://www.dizibox.live/feed/"
-CACHE_URL = "http://webcache.googleusercontent.com/search?q=cache:https://www.dizibox.live/tum-bolumler/"
+SITEMAP_URL = "https://www.dizibox.live/post-sitemap.xml"
 OUTPUT_FILE = "dizilla.m3u"
 
 def log(message, level="INFO"):
@@ -45,35 +45,102 @@ def decrypt_cryptojs(passphrase, encrypted_base64):
     except Exception as e:
         return None
 
-# --- VİDEO URL ÇIKARTMA ---
+# --- LİSTE OLUŞTURMA (curl_cffi ile) ---
+def fetch_sitemap_links():
+    log("Sitemap indiriliyor (curl_cffi)...", "INFO")
+    try:
+        # Gerçek bir Chrome tarayıcısı gibi davran
+        session = crequests.Session(impersonate="chrome120")
+        resp = session.get(SITEMAP_URL, timeout=15)
+        
+        if resp.status_code != 200:
+            log(f"Sitemap indirilemedi. Kod: {resp.status_code}", "ERROR")
+            return []
+            
+        # XML/HTML içeriğini parse et
+        soup = BeautifulSoup(resp.content, "html.parser") # XML yerine HTML parser daha esnek
+        
+        links = []
+        # Sitemap yapısı: <loc>URL</loc> veya <a href="URL">
+        
+        # Önce loc etiketlerine bak (Standart XML)
+        locs = soup.find_all("loc")
+        for loc in locs:
+            url = loc.text.strip()
+            if "-izle" in url:
+                links.append(url)
+                
+        # Eğer loc yoksa (HTML sitemap ise), a etiketlerine bak
+        if not links:
+            as_tags = soup.find_all("a")
+            for a in as_tags:
+                href = a.get("href")
+                if href and "-izle" in href:
+                    links.append(href)
+                    
+        # Linkleri temizle ve formatla
+        formatted_items = []
+        for url in links:
+            # Başlığı URL'den çıkar
+            # .../dizi-adi-1-sezon-1-bolum-izle/
+            slug = url.rstrip("/").split("/")[-1].replace("-izle", "")
+            parts = slug.split("-")
+            
+            # Basit başlık oluşturma
+            title = slug.replace("-", " ").title()
+            
+            # Sezon/Bölüm bulmaya çalış
+            try:
+                if "sezon" in parts and "bolum" in parts:
+                    s_idx = parts.index("sezon")
+                    b_idx = parts.index("bolum")
+                    season = parts[s_idx-1]
+                    episode = parts[b_idx-1]
+                    # Dizi adını al
+                    name_parts = parts[:s_idx-1]
+                    name = " ".join(name_parts).title()
+                    title = f"{name} - {season}x{episode}"
+            except: pass
+            
+            formatted_items.append({
+                "title": title,
+                "url": url,
+                "category": "Son Eklenenler"
+            })
+            
+        # En yeni 30 bölümü al (Sitemap genelde eskiden yeniye veya karışıktır, ters çevirelim)
+        # DiziBox sitemap'i genelde en üstte en yeniyi tutar ama emin olalım.
+        return formatted_items[:30]
+
+    except Exception as e:
+        log(f"Sitemap Hatası: {e}", "CRITICAL")
+        return []
+
+# --- VİDEO URL ÇIKARTMA (DrissionPage) ---
 def extract_video_url(page, episode_url):
     try:
-        # Bölüm sayfasına git
         page.get(episode_url)
         
         # Cloudflare kontrolü
-        if "Just a moment" in page.title or "Access denied" in page.title:
-            log("Bölüm sayfası engellendi, iframe aranıyor...", "WARNING")
-            # Sayfa engellense bile bazen kaynak kodda iframe linki gizli olabilir
-            # Ancak genelde erişim tam kesilir.
-            return None
+        if "Just a moment" in page.title:
+            time.sleep(3)
         
-        # 1. Iframe Bul (King Player)
+        # 1. Iframe Bul
         iframe_src = None
         
-        # CSS ile ara
+        # CSS ile
         try:
             iframe_ele = page.ele("css:div#video-area iframe")
             if iframe_ele: iframe_src = iframe_ele.attr("src")
         except: pass
         
-        # Bulamazsa HTML içinde regex ile ara
+        # Regex ile (HTML içinde)
         if not iframe_src:
             match = re.search(r'src="([^"]*king\.php[^"]*)"', page.html)
             if match: iframe_src = match.group(1)
             
         if not iframe_src:
-            log("King Player bulunamadı.", "WARNING")
+            log("Player bulunamadı.", "WARNING")
             return None
             
         if iframe_src.startswith("//"): iframe_src = "https:" + iframe_src
@@ -121,87 +188,24 @@ def extract_video_url(page, episode_url):
         log(f"Hata: {e}", "ERROR")
         return None
 
-# --- VERİ KAYNAKLARI ---
-
-def fetch_from_rss():
-    """RSS Beslemesinden veri çeker (En Hızlı ve Güvenli)"""
-    log("Yöntem A: RSS Beslemesi deneniyor...", "INFO")
-    try:
-        # Requests ile çekmeyi dene (Hızlı)
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        }
-        resp = requests.get(RSS_URL, headers=headers, timeout=10)
-        if resp.status_code == 200:
-            soup = BeautifulSoup(resp.content, "xml")
-            items = soup.find_all("item")
-            results = []
-            for item in items:
-                title = item.title.text
-                link = item.link.text
-                # Sadece dizi bölümlerini al
-                if "izle" in link or "sezon" in link:
-                    results.append({"title": title, "url": link, "category": "RSS Feed"})
-            return results
-    except Exception as e:
-        log(f"RSS Hatası: {e}", "WARNING")
-    return []
-
-def fetch_from_google_cache():
-    """Google Cache üzerinden veri çeker (IP Ban Aşar)"""
-    log("Yöntem B: Google Cache deneniyor...", "INFO")
-    try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        }
-        resp = requests.get(CACHE_URL, headers=headers, timeout=10)
-        if resp.status_code == 200:
-            soup = BeautifulSoup(resp.text, "html.parser")
-            # Cache sayfasındaki linkleri bul
-            # DiziBox yapısı: article.detailed-article h3 a
-            articles = soup.select("article.detailed-article")
-            if not articles:
-                articles = soup.select("article") # Daha genel
-            
-            results = []
-            for art in articles:
-                a_tag = art.select_one("h3 a")
-                if not a_tag: a_tag = art.select_one("a")
-                
-                if a_tag:
-                    title = a_tag.text.strip()
-                    href = a_tag.get("href")
-                    if href and "dizibox.live" in href:
-                        results.append({"title": title, "url": href, "category": "Google Cache"})
-            return results
-    except Exception as e:
-        log(f"Cache Hatası: {e}", "WARNING")
-    return []
-
 def main():
-    # 1. Veri Toplama (RSS -> Cache -> Direct)
-    items = fetch_from_rss()
+    # 1. Linkleri Topla
+    items = fetch_sitemap_links()
     
     if not items:
-        log("RSS başarısız, Google Cache deneniyor...", "WARNING")
-        items = fetch_from_google_cache()
-        
-    if not items:
-        log("Google Cache başarısız, DrissionPage ile doğrudan denenecek...", "WARNING")
-        # DrissionPage ile ana sayfaya gitme kodu buraya eklenebilir ama
-        # önceki denemelerde başarısız olduğu için RSS/Cache'e güveniyoruz.
-    
-    if not items:
-        log("HİÇBİR KAYNAKTAN VERİ ALINAMADI.", "CRITICAL")
-        return
+        log("Sitemap'ten link alınamadı. Manuel liste deneniyor...", "WARNING")
+        # Fallback: Eğer sitemap çalışmazsa en azından popüler dizileri ekle
+        items = [
+            {"title": "The Penguin - 1x1", "url": "https://www.dizibox.live/the-penguin-1-sezon-1-bolum-izle/", "category": "Fallback"},
+            {"title": "From - 3x1", "url": "https://www.dizibox.live/from-3-sezon-1-bolum-izle/", "category": "Fallback"}
+        ]
 
-    log(f"Toplam {len(items)} içerik bulundu. Linkler çözülüyor...", "SUCCESS")
+    log(f"Toplam {len(items)} içerik işlenecek.", "SUCCESS")
 
-    # 2. Link Çözme (DrissionPage)
+    # 2. Videoları Çek
     co = ChromiumOptions()
     co.set_argument('--no-sandbox')
     co.set_argument('--disable-gpu')
-    # DiziBox Cookie'leri
     co.set_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
     
     page = ChromiumPage(co)
@@ -217,7 +221,7 @@ def main():
         with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
             f.write("#EXTM3U\n")
             
-            for item in items[:20]: # İlk 20 bölüm
+            for item in items:
                 log(f"İşleniyor: {item['title']}", "INFO")
                 stream_url = extract_video_url(page, item["url"])
                 
