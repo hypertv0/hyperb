@@ -2,16 +2,22 @@ name: Dizilla Scraper Update
 
 on:
   schedule:
-    - cron: '0 0 * * *' # Her gün gece yarısı çalışır
-  workflow_dispatch: # Manuel tetikleme için
+    - cron: '0 0 * * *'
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Depoyu Çek (Checkout)
+      - name: Depoyu Çek
         uses: actions/checkout@v3
+
+      # --- İŞTE SİHİRLİ DOKUNUŞ: CLOUDFLARE WARP ---
+      - name: Cloudflare WARP Kurulumu
+        uses: fscarmen/warp-on-actions@v1.1
+        with:
+          stack: dual # Hem IPv4 hem IPv6 desteği
 
       - name: Python Kurulumu
         uses: actions/setup-python@v4
@@ -27,10 +33,10 @@ jobs:
           cd dizilla
           python main.py
 
-      - name: Değişiklikleri Commit ve Push Yap
+      - name: Değişiklikleri Kaydet
         run: |
           git config --global user.name "GitHub Action"
           git config --global user.email "action@github.com"
           git add dizilla/dizilla.m3u
-          git commit -m "Dizilla M3U Güncellendi - $(date)" || echo "Değişiklik yok"
+          git commit -m "Dizilla M3U Güncellendi (WARP) - $(date)" || echo "Değişiklik yok"
           git push
