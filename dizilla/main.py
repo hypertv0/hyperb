@@ -14,13 +14,11 @@ from bs4 import BeautifulSoup
 BASE_URL = "https://www.dizibox.live"
 OUTPUT_FILE = "dizilla.m3u"
 
-# --- LOGLAMA ---
 def log(message, level="INFO"):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] [{level}] {message}")
     sys.stdout.flush()
 
-# --- CRYPTOJS ŞİFRE ÇÖZME (Python Portu) ---
-# DiziBox player'ı CryptoJS kullanıyor. Bu fonksiyon OpenSSL KDF mantığını taklit eder.
+# --- CRYPTOJS ŞİFRE ÇÖZME (OpenSSL KDF Mantığı) ---
 def bytes_to_key(data, salt, output=48):
     data += salt
     key = hashlib.md5(data).digest()
@@ -42,7 +40,7 @@ def decrypt_cryptojs(passphrase, encrypted_base64):
         decrypted = unpad(cipher.decrypt(ciphertext), AES.block_size)
         return decrypted.decode('utf-8')
     except Exception as e:
-        log(f"Şifre çözme hatası: {e}", "ERROR")
+        log(f"Decryption Error: {e}", "ERROR")
         return None
 
 # --- VİDEO URL ÇIKARTMA ---
@@ -57,11 +55,18 @@ def extract_video_url(page, episode_url):
         # 1. Adım: Ana sayfadaki iframe'i bul (div#video-area iframe)
         # Kotlin kodunda: iframe.replace("king.php?v=", "king.php?wmode=opaque&v=")
         
-        iframe_src = page.ele("css:div#video-area iframe").attr("src")
-        if not iframe_src:
-            log("Video iframe bulunamadı.", "WARNING")
+        # DrissionPage ile iframe elementini bul
+        iframe_ele = page.ele("css:div#video-area iframe")
+        if not iframe_ele:
+            # Alternatif: Belki iframe direkt sayfadadır
+            iframe_ele = page.ele("css:iframe[src*='king.php']")
+            
+        if not iframe_ele:
+            log("Video iframe (King) bulunamadı.", "WARNING")
             return None
             
+        iframe_src = iframe_ele.attr("src")
+        
         # URL düzeltmeleri
         if iframe_src.startswith("//"): iframe_src = "https:" + iframe_src
         if "king.php" in iframe_src:
@@ -73,8 +78,21 @@ def extract_video_url(page, episode_url):
         page.get(iframe_src)
         time.sleep(2)
         
-        # 3. Adım: İçerdeki asıl player'ı veya şifreli veriyi bul
-        # Senaryo A: Doğrudan CryptoJS verisi var
+        # 3. Adım: İçerdeki asıl player'ı bul (div#Player iframe)
+        nested_iframe = page.ele("css:div#Player iframe")
+        if not nested_iframe:
+            log("İç player iframe bulunamadı.", "WARNING")
+            return None
+            
+        nested_src = nested_iframe.attr("src")
+        if nested_src.startswith("//"): nested_src = "https:" + nested_src
+        
+        log(f"Kaynak player bulundu: {nested_src}", "DEBUG")
+        
+        # 4. Adım: Kaynak player'a git ve şifreyi çöz
+        page.get(nested_src)
+        time.sleep(2)
+        
         html = page.html
         
         # bakalim.py mantığı: CryptoJS.AES.decrypt("DATA", "PASS")
@@ -92,24 +110,11 @@ def extract_video_url(page, episode_url):
                 file_match = re.search(r"file:\s*'([^']+)'", decrypted) or re.search(r'file:\s*"([^"]+)"', decrypted)
                 if file_match:
                     return file_match.group(1)
-        
-        # Senaryo B: İç içe bir iframe daha var (div#Player iframe)
-        nested_iframe = page.ele("css:div#Player iframe")
-        if nested_iframe:
-            nested_src = nested_iframe.attr("src")
-            if nested_src:
-                if nested_src.startswith("//"): nested_src = "https:" + nested_src
-                log(f"İç iframe bulundu: {nested_src}", "DEBUG")
-                
-                # Sheila/Vidmoly kontrolü (Kotlin kodundan)
-                if "sheila" in nested_src or "vidmoly" in nested_src:
-                    # Vidmoly extractor mantığı gerekebilir ama şimdilik direkt linki döndürelim
-                    # veya içine girip m3u8 arayalım.
-                    page.get(nested_src)
-                    time.sleep(2)
-                    m3u8_match = re.search(r'file:\s*"([^"]+\.m3u8[^"]*)"', page.html)
-                    if m3u8_match:
-                        return m3u8_match.group(1)
+        else:
+            # Belki şifreli değildir, direkt m3u8 vardır
+            m3u8_match = re.search(r'file:\s*"([^"]+\.m3u8[^"]*)"', html)
+            if m3u8_match:
+                return m3u8_match.group(1)
                     
         return None
 
@@ -122,14 +127,12 @@ def main():
     co = ChromiumOptions()
     co.set_argument('--no-sandbox')
     co.set_argument('--disable-gpu')
-    
-    # DiziBox için gerekli çerezler (Kotlin kodundan alındı)
-    # Bu çerezler "Adblock kapat" uyarısını ve bazı engelleri aşar.
+    # DiziBox için User-Agent
     co.set_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
     
     page = ChromiumPage(co)
     
-    # Çerezleri ayarla
+    # Çerezleri ayarla (Kotlin kodundan)
     page.set.cookies([
         {'name': 'LockUser', 'value': 'true', 'domain': '.dizibox.live'},
         {'name': 'isTrustedUser', 'value': 'true', 'domain': '.dizibox.live'},
@@ -144,55 +147,88 @@ def main():
         page.get(url)
         
         # Cloudflare Kontrolü
-        if "Just a moment" in page.title:
-            log("Cloudflare bekleniyor...", "WARNING")
-            time.sleep(6)
+        for i in range(10):
+            if "Just a moment" in page.title:
+                log(f"Cloudflare bekleniyor... ({i+1}/10)", "WARNING")
+                time.sleep(2)
+            else:
+                break
             
         if "Just a moment" in page.title:
             log("Cloudflare aşılamadı.", "CRITICAL")
             page.quit()
             return
 
-        log("Ana sayfaya erişildi.", "SUCCESS")
+        log("Ana sayfaya erişildi. Linkler taranıyor...", "SUCCESS")
         
-        # 2. Bölümleri Topla
-        # Seçici: article.detailed-article (Kotlin kodundan)
-        articles = page.eles("css:article.detailed-article")
+        # 2. Bölümleri Topla (GENİŞ KAPSAMLI ARAMA)
+        # Belirli bir class'a bağlı kalmadan, URL yapısına göre arıyoruz.
+        # DiziBox bölüm linkleri genelde "-izle/" ile biter veya içinde "-sezon-" geçer.
         
-        if not articles:
-            # Alternatif seçici
-            articles = page.eles("css:article.article-episode-card")
-            
-        log(f"{len(articles)} adet bölüm bulundu.", "INFO")
+        all_links = page.eles("tag:a")
+        log(f"Sayfada {len(all_links)} link bulundu. Filtreleniyor...", "INFO")
         
         items = []
-        for article in articles[:15]: # İlk 15 bölüm
+        for link in all_links:
             try:
-                # Başlık ve Link
-                h3_a = article.ele("css:h3 a")
-                if not h3_a: continue
+                href = link.attr("href")
+                if not href: continue
                 
-                title = h3_a.text.strip()
-                href = h3_a.attr("href")
-                
-                # Resim (Opsiyonel)
-                img = article.ele("tag:img")
-                poster = img.attr("data-src") or img.attr("src") if img else ""
-                
-                # Başlık temizleme (Dizi Adı - Sezon x Bölüm)
-                # Genelde title zaten düzgün gelir ama kontrol edelim.
-                
-                full_url = href
-                if not full_url.startswith("http"):
-                    full_url = BASE_URL + full_url
-                
-                items.append({
-                    "title": title,
-                    "url": full_url,
-                    "category": "Son Eklenenler",
-                    "poster": poster
-                })
+                # Filtre: DiziBox bölüm linki mi?
+                # Örnek: https://www.dizibox.live/dizi-adi-1-sezon-1-bolum-izle/
+                if "-izle" in href and "-sezon-" in href:
+                    
+                    # Başlığı bulmaya çalış
+                    # Linkin içinde h3 varsa başlık odur, yoksa linkin textidir.
+                    # DrissionPage ile elementin iç HTML'ine bakabiliriz.
+                    
+                    # Linkin kendisi bir kapsayıcı olabilir
+                    inner_html = link.html
+                    soup = BeautifulSoup(inner_html, 'html.parser')
+                    
+                    h3 = soup.find("h3")
+                    if h3:
+                        title = h3.text.strip()
+                    else:
+                        # Belki resim alt etiketi vardır
+                        img = soup.find("img")
+                        if img and img.get("alt"):
+                            title = img.get("alt")
+                        else:
+                            # Hiçbiri yoksa linkin metni (bazı temalarda)
+                            title = soup.get_text().strip()
+                    
+                    if not title: continue
+                    
+                    # Poster (Opsiyonel)
+                    img_tag = soup.find("img")
+                    poster = ""
+                    if img_tag:
+                        poster = img_tag.get("data-src") or img_tag.get("src") or ""
+
+                    # URL düzeltme
+                    full_url = href
+                    if not full_url.startswith("http"):
+                        full_url = BASE_URL + full_url
+                        
+                    # Tekrarı önle
+                    if not any(d['url'] == full_url for d in items):
+                        items.append({
+                            "title": title,
+                            "url": full_url,
+                            "category": "Son Eklenenler",
+                            "poster": poster
+                        })
+                        
+                if len(items) >= 20: break # 20 bölüm yeter
             except: continue
+            
+        if len(items) == 0:
+            log("HİÇ BÖLÜM BULUNAMADI! HTML yapısı değişmiş olabilir.", "CRITICAL")
+            # Debug için HTML'in bir kısmını yazdır
+            log(f"HTML DUMP (İlk 1000 karakter): {page.html[:1000]}", "DEBUG")
+        else:
+            log(f"{len(items)} adet bölüm bulundu. Linkler çözülüyor...", "INFO")
             
         # 3. Linkleri Çöz ve M3U Oluştur
         if items:
@@ -209,7 +245,10 @@ def main():
                         if ".m3u8" in stream_url:
                             final_url = f"{stream_url}|User-Agent={page.user_agent}"
                         
-                        f.write(f'#EXTINF:-1 group-title="{item["category"]}" tvg-logo="{item["poster"]}", {item["title"]}\n')
+                        # Poster varsa ekle
+                        logo_attr = f'tvg-logo="{item["poster"]}"' if item["poster"] else ""
+                        
+                        f.write(f'#EXTINF:-1 group-title="{item["category"]}" {logo_attr}, {item["title"]}\n')
                         f.write(f"{final_url}\n")
                         log("Eklendi.", "SUCCESS")
                     else:
@@ -217,10 +256,10 @@ def main():
                     
                     time.sleep(1)
         else:
-            log("Liste boş, içerik çekilemedi.", "WARNING")
+            log("Liste boş, dosya oluşturulmadı.", "WARNING")
 
     except Exception as e:
-        log(f"Genel Hata: {e}", "CRITICAL")
+        log(f"Kritik Hata: {e}", "CRITICAL")
     finally:
         page.quit()
 
