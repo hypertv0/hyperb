@@ -11,14 +11,18 @@ from Crypto.Util.Padding import unpad
 from bs4 import BeautifulSoup
 
 # --- AYARLAR ---
-BASE_URL = "https://www.dizibox.live"
+REAL_BASE_URL = "https://www.dizibox.live"
+# Google Translate Proxy URL'si
+PROXY_BASE_URL = "https://www-dizibox-live.translate.goog"
+PROXY_PARAMS = "?_x_tr_sl=auto&_x_tr_tl=tr&_x_tr_hl=tr&_x_tr_pto=wapp"
+
 OUTPUT_FILE = "dizilla.m3u"
 
 def log(message, level="INFO"):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] [{level}] {message}")
     sys.stdout.flush()
 
-# --- CRYPTOJS ŞİFRE ÇÖZME (OpenSSL KDF Mantığı) ---
+# --- CRYPTOJS ŞİFRE ÇÖZME ---
 def bytes_to_key(data, salt, output=48):
     data += salt
     key = hashlib.md5(data).digest()
@@ -43,79 +47,127 @@ def decrypt_cryptojs(passphrase, encrypted_base64):
         log(f"Decryption Error: {e}", "ERROR")
         return None
 
+# --- URL DÖNÜŞTÜRÜCÜ ---
+def get_translate_url(original_path):
+    """Normal yolu Google Translate URL'ine çevirir"""
+    # /dizi-adi-izle/ -> https://www-dizibox-live.translate.goog/dizi-adi-izle/?...
+    if original_path.startswith("http"):
+        if "translate.goog" in original_path:
+            return original_path
+        # Tam URL ise path'i al
+        original_path = original_path.replace(REAL_BASE_URL, "")
+    
+    return f"{PROXY_BASE_URL}{original_path}{PROXY_PARAMS}"
+
 # --- VİDEO URL ÇIKARTMA ---
 def extract_video_url(page, episode_url):
     try:
-        page.get(episode_url)
+        # Google Translate üzerinden git
+        safe_url = get_translate_url(episode_url)
+        log(f"Google üzerinden gidiliyor: {safe_url}", "DEBUG")
+        
+        page.get(safe_url)
         
         # Cloudflare kontrolü
         if "Just a moment" in page.title:
             time.sleep(5)
         
-        # 1. Adım: Ana sayfadaki iframe'i bul (div#video-area iframe)
-        # Kotlin kodunda: iframe.replace("king.php?v=", "king.php?wmode=opaque&v=")
+        # 1. Adım: Iframe Bul (King Player)
+        # Google Translate iframe'leri değiştirebilir, geniş arama yapalım
+        # Orijinal: src=".../king.php?v=..."
         
-        # DrissionPage ile iframe elementini bul
-        iframe_ele = page.ele("css:div#video-area iframe")
-        if not iframe_ele:
-            # Alternatif: Belki iframe direkt sayfadadır
-            iframe_ele = page.ele("css:iframe[src*='king.php']")
-            
-        if not iframe_ele:
+        iframe_src = None
+        
+        # Tüm iframe'leri tara
+        iframes = page.eles("tag:iframe")
+        for ifr in iframes:
+            src = ifr.attr("src")
+            if src and "king.php" in src:
+                iframe_src = src
+                break
+        
+        if not iframe_src:
+            # Belki HTML text içinde vardır (Google bazen iframe'i render etmez)
+            html = page.html
+            match = re.search(r'src="([^"]*king\.php[^"]*)"', html)
+            if match:
+                iframe_src = match.group(1)
+
+        if not iframe_src:
             log("Video iframe (King) bulunamadı.", "WARNING")
             return None
             
-        iframe_src = iframe_ele.attr("src")
+        # URL düzeltmeleri (Google Translate URL'ini temizle veya olduğu gibi kullan)
+        # Eğer iframe src'si translate.goog ise, onu kullanabiliriz.
+        # Değilse, manuel çevirelim.
         
-        # URL düzeltmeleri
+        # King.php linkini alıp temizleyelim
+        # Örnek: https://www-dizibox-live.translate.goog/player/king.php?...
+        
         if iframe_src.startswith("//"): iframe_src = "https:" + iframe_src
+        
+        # wmode ekle
         if "king.php" in iframe_src:
             iframe_src = iframe_src.replace("king.php?v=", "king.php?wmode=opaque&v=")
             
-        log(f"Player bulundu, gidiliyor: {iframe_src}", "DEBUG")
+        log(f"Player bulundu: {iframe_src}", "DEBUG")
         
-        # 2. Adım: Player iframe'ine git
+        # 2. Adım: Player'a git
         page.get(iframe_src)
         time.sleep(2)
         
         # 3. Adım: İçerdeki asıl player'ı bul (div#Player iframe)
-        nested_iframe = page.ele("css:div#Player iframe")
-        if not nested_iframe:
-            log("İç player iframe bulunamadı.", "WARNING")
-            return None
-            
-        nested_src = nested_iframe.attr("src")
-        if nested_src.startswith("//"): nested_src = "https:" + nested_src
-        
-        log(f"Kaynak player bulundu: {nested_src}", "DEBUG")
-        
-        # 4. Adım: Kaynak player'a git ve şifreyi çöz
-        page.get(nested_src)
-        time.sleep(2)
-        
+        # Google Translate içinde element seçimi zor olabilir, HTML regex kullanalım
         html = page.html
         
-        # bakalim.py mantığı: CryptoJS.AES.decrypt("DATA", "PASS")
+        # Senaryo A: Doğrudan CryptoJS verisi var mı?
         match_data = re.search(r'CryptoJS\.AES\.decrypt\("([^"]+)",\s*"([^"]+)"\)', html)
         
         if match_data:
             encrypted_data = match_data.group(1)
             passphrase = match_data.group(2)
             
-            log("Şifreli veri bulundu, çözülüyor...", "INFO")
+            log("Şifreli veri bulundu (Ana Player), çözülüyor...", "INFO")
             decrypted = decrypt_cryptojs(passphrase, encrypted_data)
             
             if decrypted:
-                # Çözülen verinin içinde "file": "..." arıyoruz
                 file_match = re.search(r"file:\s*'([^']+)'", decrypted) or re.search(r'file:\s*"([^"]+)"', decrypted)
                 if file_match:
                     return file_match.group(1)
-        else:
-            # Belki şifreli değildir, direkt m3u8 vardır
+
+        # Senaryo B: İç içe iframe (div#Player)
+        # Regex ile src bulalım
+        nested_match = re.search(r'<div id="Player">.*?<iframe.*?src="([^"]+)".*?>', html, re.DOTALL)
+        if nested_match:
+            nested_src = nested_match.group(1)
+            if nested_src.startswith("//"): nested_src = "https:" + nested_src
+            
+            # Google Translate URL'i olabilir, sorun değil
+            log(f"Kaynak player bulundu: {nested_src}", "DEBUG")
+            
+            page.get(nested_src)
+            time.sleep(2)
+            html = page.html
+            
+            # Tekrar CryptoJS ara
+            match_data = re.search(r'CryptoJS\.AES\.decrypt\("([^"]+)",\s*"([^"]+)"\)', html)
+            if match_data:
+                encrypted_data = match_data.group(1)
+                passphrase = match_data.group(2)
+                
+                log("Şifreli veri bulundu (İç Player), çözülüyor...", "INFO")
+                decrypted = decrypt_cryptojs(passphrase, encrypted_data)
+                
+                if decrypted:
+                    file_match = re.search(r"file:\s*'([^']+)'", decrypted) or re.search(r'file:\s*"([^"]+)"', decrypted)
+                    if file_match:
+                        return file_match.group(1)
+            
+            # M3U8 ara
             m3u8_match = re.search(r'file:\s*"([^"]+\.m3u8[^"]*)"', html)
             if m3u8_match:
                 return m3u8_match.group(1)
-                    
+
         return None
 
     except Exception as e:
@@ -123,50 +175,37 @@ def extract_video_url(page, episode_url):
         return None
 
 def main():
-    # DrissionPage Ayarları
     co = ChromiumOptions()
     co.set_argument('--no-sandbox')
     co.set_argument('--disable-gpu')
-    # DiziBox için User-Agent
-    co.set_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
+    co.set_argument('--disable-translate') # Google Translate barını kapat
     
     page = ChromiumPage(co)
     
-    # Çerezleri ayarla (Kotlin kodundan)
-    page.set.cookies([
-        {'name': 'LockUser', 'value': 'true', 'domain': '.dizibox.live'},
-        {'name': 'isTrustedUser', 'value': 'true', 'domain': '.dizibox.live'},
-        {'name': 'dbxu', 'value': '1744054959089', 'domain': '.dizibox.live'}
-    ])
-
     try:
-        log("DiziBox Tarayıcı Başlatıldı.", "INFO")
+        log("DiziBox (Google Proxy) Başlatıldı.", "INFO")
         
-        # 1. Son Bölümler Sayfasına Git
-        url = f"{BASE_URL}/tum-bolumler/"
-        page.get(url)
+        # 1. Son Bölümler Sayfasına Git (Google Translate üzerinden)
+        start_url = f"{PROXY_BASE_URL}/tum-bolumler/{PROXY_PARAMS}"
+        log(f"Bağlanılıyor: {start_url}", "INFO")
+        
+        page.get(start_url)
         
         # Cloudflare Kontrolü
-        for i in range(10):
-            if "Just a moment" in page.title:
-                log(f"Cloudflare bekleniyor... ({i+1}/10)", "WARNING")
-                time.sleep(2)
-            else:
-                break
-            
-        if "Just a moment" in page.title:
-            log("Cloudflare aşılamadı.", "CRITICAL")
+        time.sleep(5)
+        if "Access denied" in page.title:
+            log("HATA: Google Translate üzerinden bile engellendi!", "CRITICAL")
             page.quit()
             return
 
         log("Ana sayfaya erişildi. Linkler taranıyor...", "SUCCESS")
         
-        # 2. Bölümleri Topla (GENİŞ KAPSAMLI ARAMA)
-        # Belirli bir class'a bağlı kalmadan, URL yapısına göre arıyoruz.
-        # DiziBox bölüm linkleri genelde "-izle/" ile biter veya içinde "-sezon-" geçer.
+        # 2. Bölümleri Topla
+        # Google Translate linkleri değiştirir.
+        # Linkler: https://www-dizibox-live.translate.goog/dizi-adi-izle/?...
         
         all_links = page.eles("tag:a")
-        log(f"Sayfada {len(all_links)} link bulundu. Filtreleniyor...", "INFO")
+        log(f"Sayfada {len(all_links)} link bulundu.", "INFO")
         
         items = []
         for link in all_links:
@@ -175,58 +214,51 @@ def main():
                 if not href: continue
                 
                 # Filtre: DiziBox bölüm linki mi?
-                # Örnek: https://www.dizibox.live/dizi-adi-1-sezon-1-bolum-izle/
+                # Orijinalde "-izle" ve "-sezon-" içerir.
+                # Translate URL'inde de bu path korunur.
+                
                 if "-izle" in href and "-sezon-" in href:
                     
-                    # Başlığı bulmaya çalış
-                    # Linkin içinde h3 varsa başlık odur, yoksa linkin textidir.
-                    # DrissionPage ile elementin iç HTML'ine bakabiliriz.
+                    # Başlık Çıkarma
+                    # Linkin içindeki metne veya resme bakalım
+                    link_html = link.html
+                    soup = BeautifulSoup(link_html, 'html.parser')
                     
-                    # Linkin kendisi bir kapsayıcı olabilir
-                    inner_html = link.html
-                    soup = BeautifulSoup(inner_html, 'html.parser')
-                    
+                    # H3 veya IMG alt
                     h3 = soup.find("h3")
                     if h3:
                         title = h3.text.strip()
                     else:
-                        # Belki resim alt etiketi vardır
                         img = soup.find("img")
                         if img and img.get("alt"):
                             title = img.get("alt")
                         else:
-                            # Hiçbiri yoksa linkin metni (bazı temalarda)
                             title = soup.get_text().strip()
                     
                     if not title: continue
                     
-                    # Poster (Opsiyonel)
+                    # Poster
                     img_tag = soup.find("img")
                     poster = ""
                     if img_tag:
                         poster = img_tag.get("data-src") or img_tag.get("src") or ""
 
-                    # URL düzeltme
-                    full_url = href
-                    if not full_url.startswith("http"):
-                        full_url = BASE_URL + full_url
-                        
                     # Tekrarı önle
-                    if not any(d['url'] == full_url for d in items):
+                    # href zaten Google Translate URL'i, bunu direkt kullanabiliriz
+                    if not any(d['title'] == title for d in items):
                         items.append({
                             "title": title,
-                            "url": full_url,
+                            "url": href, # Bu URL zaten translate.goog domainli
                             "category": "Son Eklenenler",
                             "poster": poster
                         })
                         
-                if len(items) >= 20: break # 20 bölüm yeter
+                if len(items) >= 20: break
             except: continue
             
         if len(items) == 0:
-            log("HİÇ BÖLÜM BULUNAMADI! HTML yapısı değişmiş olabilir.", "CRITICAL")
-            # Debug için HTML'in bir kısmını yazdır
-            log(f"HTML DUMP (İlk 1000 karakter): {page.html[:1000]}", "DEBUG")
+            log("HİÇ BÖLÜM BULUNAMADI! HTML yapısı debug ediliyor...", "CRITICAL")
+            # log(f"HTML DUMP: {page.html[:1000]}", "DEBUG")
         else:
             log(f"{len(items)} adet bölüm bulundu. Linkler çözülüyor...", "INFO")
             
@@ -237,15 +269,15 @@ def main():
                 
                 for item in items:
                     log(f"İşleniyor: {item['title']}", "INFO")
+                    # item['url'] zaten translate linki, direkt gönderiyoruz
                     stream_url = extract_video_url(page, item["url"])
                     
                     if stream_url:
-                        # User-Agent ekle
+                        ua = page.user_agent
                         final_url = stream_url
                         if ".m3u8" in stream_url:
-                            final_url = f"{stream_url}|User-Agent={page.user_agent}"
+                            final_url = f"{stream_url}|User-Agent={ua}"
                         
-                        # Poster varsa ekle
                         logo_attr = f'tvg-logo="{item["poster"]}"' if item["poster"] else ""
                         
                         f.write(f'#EXTINF:-1 group-title="{item["category"]}" {logo_attr}, {item["title"]}\n')
@@ -256,7 +288,7 @@ def main():
                     
                     time.sleep(1)
         else:
-            log("Liste boş, dosya oluşturulmadı.", "WARNING")
+            log("Liste boş.", "WARNING")
 
     except Exception as e:
         log(f"Kritik Hata: {e}", "CRITICAL")
