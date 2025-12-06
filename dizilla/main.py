@@ -4,6 +4,7 @@ import time
 import re
 import sys
 import hashlib
+import requests
 from datetime import datetime
 from DrissionPage import ChromiumPage, ChromiumOptions
 from Crypto.Cipher import AES
@@ -11,13 +12,9 @@ from Crypto.Util.Padding import unpad
 from bs4 import BeautifulSoup
 
 # --- AYARLAR ---
-REAL_BASE_URL = "https://www.dizibox.live"
-# Sitemap Adresi (Google Translate üzerinden)
-SITEMAP_URL = "https://www-dizibox-live.translate.goog/post-sitemap.xml?_x_tr_sl=auto&_x_tr_tl=tr&_x_tr_hl=tr&_x_tr_pto=wapp"
-# Video sayfaları için proxy base
-PROXY_BASE_URL = "https://www-dizibox-live.translate.goog"
-PROXY_PARAMS = "?_x_tr_sl=auto&_x_tr_tl=tr&_x_tr_hl=tr&_x_tr_pto=wapp"
-
+BASE_URL = "https://www.dizibox.live"
+RSS_URL = "https://www.dizibox.live/feed/"
+CACHE_URL = "http://webcache.googleusercontent.com/search?q=cache:https://www.dizibox.live/tum-bolumler/"
 OUTPUT_FILE = "dizilla.m3u"
 
 def log(message, level="INFO"):
@@ -46,77 +43,35 @@ def decrypt_cryptojs(passphrase, encrypted_base64):
         decrypted = unpad(cipher.decrypt(ciphertext), AES.block_size)
         return decrypted.decode('utf-8')
     except Exception as e:
-        log(f"Decryption Error: {e}", "ERROR")
         return None
-
-# --- URL DÖNÜŞTÜRÜCÜ ---
-def get_translate_url(original_url):
-    """Orijinal URL'i Google Translate URL'ine çevirir"""
-    if "translate.goog" in original_url:
-        return original_url
-    
-    # https://www.dizibox.live/dizi-adi... -> /dizi-adi...
-    path = original_url.replace(REAL_BASE_URL, "")
-    return f"{PROXY_BASE_URL}{path}{PROXY_PARAMS}"
-
-# --- BAŞLIK AYIKLAYICI ---
-def parse_title_from_url(url):
-    """URL'den Dizi Adı ve Bölüm bilgisini çıkarır"""
-    # Örnek: https://www.dizibox.live/the-price-of-confession-1-sezon-1-bolum-izle/
-    try:
-        # Domaini at, son slash'ı at
-        slug = url.rstrip("/").split("/")[-1]
-        
-        # "-izle" kısmını at
-        slug = slug.replace("-izle", "")
-        
-        # Sezon ve Bölüm bul
-        # Regex: (.*)-(\d+)-sezon-(\d+)-bolum
-        match = re.search(r"(.*)-(\d+)-sezon-(\d+)-bolum", slug)
-        
-        if match:
-            name_slug = match.group(1)
-            season = match.group(2)
-            episode = match.group(3)
-            
-            # İsmi düzelt (tireleri boşluk yap, baş harfleri büyüt)
-            name = name_slug.replace("-", " ").title()
-            
-            return f"{name} - {season}x{episode}"
-        
-        return slug.replace("-", " ").title()
-    except:
-        return "Bilinmeyen Dizi"
 
 # --- VİDEO URL ÇIKARTMA ---
 def extract_video_url(page, episode_url):
     try:
-        safe_url = get_translate_url(episode_url)
-        log(f"Video aranıyor: {safe_url}", "DEBUG")
+        # Bölüm sayfasına git
+        page.get(episode_url)
         
-        page.get(safe_url)
-        
-        if "Just a moment" in page.title:
-            time.sleep(5)
+        # Cloudflare kontrolü
+        if "Just a moment" in page.title or "Access denied" in page.title:
+            log("Bölüm sayfası engellendi, iframe aranıyor...", "WARNING")
+            # Sayfa engellense bile bazen kaynak kodda iframe linki gizli olabilir
+            # Ancak genelde erişim tam kesilir.
+            return None
         
         # 1. Iframe Bul (King Player)
         iframe_src = None
         
-        # Sayfa kaynağında 'king.php' ara (En garantisi)
-        html = page.html
-        match = re.search(r'src="([^"]*king\.php[^"]*)"', html)
+        # CSS ile ara
+        try:
+            iframe_ele = page.ele("css:div#video-area iframe")
+            if iframe_ele: iframe_src = iframe_ele.attr("src")
+        except: pass
         
-        if match:
-            iframe_src = match.group(1)
-        else:
-            # Element olarak ara
-            iframes = page.eles("tag:iframe")
-            for ifr in iframes:
-                src = ifr.attr("src")
-                if src and "king.php" in src:
-                    iframe_src = src
-                    break
-        
+        # Bulamazsa HTML içinde regex ile ara
+        if not iframe_src:
+            match = re.search(r'src="([^"]*king\.php[^"]*)"', page.html)
+            if match: iframe_src = match.group(1)
+            
         if not iframe_src:
             log("King Player bulunamadı.", "WARNING")
             return None
@@ -127,11 +82,12 @@ def extract_video_url(page, episode_url):
             
         # 2. Player'a git
         page.get(iframe_src)
-        time.sleep(2)
+        time.sleep(1)
+        
+        # 3. Şifre Çözme
         html = page.html
         
-        # 3. Şifre Çözme (CryptoJS)
-        # Senaryo A: Ana sayfada şifre
+        # Senaryo A: Ana Player
         match_data = re.search(r'CryptoJS\.AES\.decrypt\("([^"]+)",\s*"([^"]+)"\)', html)
         if match_data:
             decrypted = decrypt_cryptojs(match_data.group(2), match_data.group(1))
@@ -139,14 +95,14 @@ def extract_video_url(page, episode_url):
                 file_match = re.search(r"file:\s*'([^']+)'", decrypted) or re.search(r'file:\s*"([^"]+)"', decrypted)
                 if file_match: return file_match.group(1)
 
-        # Senaryo B: İç içe iframe (div#Player)
+        # Senaryo B: İç Player (div#Player)
         nested_match = re.search(r'<div id="Player">.*?<iframe.*?src="([^"]+)".*?>', html, re.DOTALL)
         if nested_match:
             nested_src = nested_match.group(1)
             if nested_src.startswith("//"): nested_src = "https:" + nested_src
             
             page.get(nested_src)
-            time.sleep(2)
+            time.sleep(1)
             html = page.html
             
             match_data = re.search(r'CryptoJS\.AES\.decrypt\("([^"]+)",\s*"([^"]+)"\)', html)
@@ -156,7 +112,6 @@ def extract_video_url(page, episode_url):
                     file_match = re.search(r"file:\s*'([^']+)'", decrypted) or re.search(r'file:\s*"([^"]+)"', decrypted)
                     if file_match: return file_match.group(1)
             
-            # M3U8 direkt var mı?
             m3u8_match = re.search(r'file:\s*"([^"]+\.m3u8[^"]*)"', html)
             if m3u8_match: return m3u8_match.group(1)
 
@@ -166,93 +121,119 @@ def extract_video_url(page, episode_url):
         log(f"Hata: {e}", "ERROR")
         return None
 
+# --- VERİ KAYNAKLARI ---
+
+def fetch_from_rss():
+    """RSS Beslemesinden veri çeker (En Hızlı ve Güvenli)"""
+    log("Yöntem A: RSS Beslemesi deneniyor...", "INFO")
+    try:
+        # Requests ile çekmeyi dene (Hızlı)
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        }
+        resp = requests.get(RSS_URL, headers=headers, timeout=10)
+        if resp.status_code == 200:
+            soup = BeautifulSoup(resp.content, "xml")
+            items = soup.find_all("item")
+            results = []
+            for item in items:
+                title = item.title.text
+                link = item.link.text
+                # Sadece dizi bölümlerini al
+                if "izle" in link or "sezon" in link:
+                    results.append({"title": title, "url": link, "category": "RSS Feed"})
+            return results
+    except Exception as e:
+        log(f"RSS Hatası: {e}", "WARNING")
+    return []
+
+def fetch_from_google_cache():
+    """Google Cache üzerinden veri çeker (IP Ban Aşar)"""
+    log("Yöntem B: Google Cache deneniyor...", "INFO")
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        }
+        resp = requests.get(CACHE_URL, headers=headers, timeout=10)
+        if resp.status_code == 200:
+            soup = BeautifulSoup(resp.text, "html.parser")
+            # Cache sayfasındaki linkleri bul
+            # DiziBox yapısı: article.detailed-article h3 a
+            articles = soup.select("article.detailed-article")
+            if not articles:
+                articles = soup.select("article") # Daha genel
+            
+            results = []
+            for art in articles:
+                a_tag = art.select_one("h3 a")
+                if not a_tag: a_tag = art.select_one("a")
+                
+                if a_tag:
+                    title = a_tag.text.strip()
+                    href = a_tag.get("href")
+                    if href and "dizibox.live" in href:
+                        results.append({"title": title, "url": href, "category": "Google Cache"})
+            return results
+    except Exception as e:
+        log(f"Cache Hatası: {e}", "WARNING")
+    return []
+
 def main():
+    # 1. Veri Toplama (RSS -> Cache -> Direct)
+    items = fetch_from_rss()
+    
+    if not items:
+        log("RSS başarısız, Google Cache deneniyor...", "WARNING")
+        items = fetch_from_google_cache()
+        
+    if not items:
+        log("Google Cache başarısız, DrissionPage ile doğrudan denenecek...", "WARNING")
+        # DrissionPage ile ana sayfaya gitme kodu buraya eklenebilir ama
+        # önceki denemelerde başarısız olduğu için RSS/Cache'e güveniyoruz.
+    
+    if not items:
+        log("HİÇBİR KAYNAKTAN VERİ ALINAMADI.", "CRITICAL")
+        return
+
+    log(f"Toplam {len(items)} içerik bulundu. Linkler çözülüyor...", "SUCCESS")
+
+    # 2. Link Çözme (DrissionPage)
     co = ChromiumOptions()
     co.set_argument('--no-sandbox')
     co.set_argument('--disable-gpu')
-    co.set_argument('--disable-translate')
+    # DiziBox Cookie'leri
+    co.set_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
     
     page = ChromiumPage(co)
     
-    try:
-        log("Sitemap Tarayıcı Başlatıldı.", "INFO")
-        
-        # 1. Sitemap'e Git
-        log(f"Sitemap okunuyor: {SITEMAP_URL}", "INFO")
-        page.get(SITEMAP_URL)
-        
-        time.sleep(5)
-        if "Access denied" in page.title:
-            log("HATA: Sitemap erişimi engellendi!", "CRITICAL")
-            page.quit()
-            return
+    # Cookie Ekle
+    page.set.cookies([
+        {'name': 'LockUser', 'value': 'true', 'domain': '.dizibox.live'},
+        {'name': 'isTrustedUser', 'value': 'true', 'domain': '.dizibox.live'},
+        {'name': 'dbxu', 'value': str(int(time.time() * 1000)), 'domain': '.dizibox.live'}
+    ])
 
-        # 2. Linkleri Tablodan Çek
-        # HTML yapısı: <td class="left"><a href="...">...</a></td>
-        # DrissionPage ile bu yapıyı bulalım
-        
-        links = []
-        # Tablo satırlarını al
-        rows = page.eles("tag:tr")
-        
-        log(f"Sitemap'te {len(rows)} satır bulundu.", "INFO")
-        
-        for row in rows:
-            try:
-                # Sol hücredeki linki al
-                a_tag = row.ele("css:td.left a")
-                if not a_tag: continue
-                
-                href = a_tag.attr("href")
-                if not href: continue
-                
-                # Sadece bölüm linklerini al (-izle ile bitenler)
-                if "-izle" not in href: continue
-                
-                # Başlığı URL'den çıkar
-                title = parse_title_from_url(href)
-                
-                links.append({
-                    "title": title,
-                    "url": href,
-                    "category": "Son Eklenenler"
-                })
-                
-                # İlk 20 bölümü alıp çıkalım (Sitemap çok büyük olabilir)
-                if len(links) >= 20: break
-                
-            except: continue
+    try:
+        with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+            f.write("#EXTM3U\n")
             
-        if not links:
-            log("Sitemap'ten link çıkarılamadı. HTML yapısı farklı olabilir.", "CRITICAL")
-            log(f"HTML DUMP: {page.html[:1000]}", "DEBUG")
-        else:
-            log(f"{len(links)} adet yeni bölüm bulundu.", "SUCCESS")
-            
-        # 3. Videoları Çek ve M3U Oluştur
-        if links:
-            with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
-                f.write("#EXTM3U\n")
+            for item in items[:20]: # İlk 20 bölüm
+                log(f"İşleniyor: {item['title']}", "INFO")
+                stream_url = extract_video_url(page, item["url"])
                 
-                for item in links:
-                    log(f"İşleniyor: {item['title']}", "INFO")
-                    stream_url = extract_video_url(page, item["url"])
+                if stream_url:
+                    ua = page.user_agent
+                    final_url = stream_url
+                    if ".m3u8" in stream_url:
+                        final_url = f"{stream_url}|User-Agent={ua}"
                     
-                    if stream_url:
-                        ua = page.user_agent
-                        final_url = stream_url
-                        if ".m3u8" in stream_url:
-                            final_url = f"{stream_url}|User-Agent={ua}"
-                        
-                        f.write(f'#EXTINF:-1 group-title="{item["category"]}", {item["title"]}\n')
-                        f.write(f"{final_url}\n")
-                        log("Eklendi.", "SUCCESS")
-                    else:
-                        log("Stream bulunamadı.", "WARNING")
-                    
-                    time.sleep(1)
-        else:
-            log("Liste boş.", "WARNING")
+                    f.write(f'#EXTINF:-1 group-title="{item["category"]}", {item["title"]}\n')
+                    f.write(f"{final_url}\n")
+                    log("Eklendi.", "SUCCESS")
+                else:
+                    log("Stream bulunamadı.", "WARNING")
+                
+                time.sleep(1)
 
     except Exception as e:
         log(f"Kritik Hata: {e}", "CRITICAL")
