@@ -1,53 +1,36 @@
-name: Dizilla Botu
+name: Dizilla Scraper Update
 
 on:
   schedule:
-    # Türkiye Saati ile 12:30'da çalışır (UTC 09:30)
-    - cron: '30 9 * * *'
-  workflow_dispatch: # Manuel çalıştırma butonu
-
-permissions:
-  contents: write
+    - cron: '0 0 * * *' # Her gün gece yarısı çalışır
+  workflow_dispatch: # Manuel tetikleme için
 
 jobs:
-  scrape_dizilla:
+  build:
     runs-on: ubuntu-latest
-    # İşlem Selenium ve detaylı tarama içerdiği için 6 saat süre tanıyalım
-    timeout-minutes: 360
 
     steps:
-    - name: Depoyu Çek (Checkout)
-      uses: actions/checkout@v4
+      - name: Depoyu Çek (Checkout)
+        uses: actions/checkout@v3
 
-    - name: Python Kurulumu (3.10)
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.10'
+      - name: Python Kurulumu
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
 
-    - name: Chrome Tarayıcı Kontrolü
-      # GitHub runner'larında Chrome yüklüdür, sürümü loga yazdıralım
-      run: google-chrome --version
+      - name: Kütüphaneleri Yükle
+        run: |
+          pip install -r dizilla/requirements.txt
 
-    - name: Kütüphaneleri Yükle
-      # Selenium, aiohttp ve diğer gereksinimleri yükler
-      run: |
-        pip install --upgrade pip
-        pip install -r dizilla/requirements.txt
+      - name: Scripti Çalıştır
+        run: |
+          cd dizilla
+          python main.py
 
-    - name: Dizilla Scriptini Çalıştır
-      # Selenium (Headless Chrome) ile domaini bulur ve aiohttp ile tarar
-      run: python dizilla/dizilla_full_scraper.py
-
-    - name: Sonuçları Kaydet (Commit & Push)
-      run: |
-        git config --global user.name "DizillaBot"
-        git config --global user.email "bot@dizilla.com"
-        
-        # veritabanı ve m3u dosyasını ekle (Hata almamak için || true kullanıyoruz)
-        git add dizilla_db.json dizilla_archive.m3u || true
-        
-        # Değişiklik varsa commit at, yoksa "Değişiklik yok" yazıp geç
-        git commit -m "Dizilla Arşivi Güncellendi: $(date)" || echo "Değişiklik yok, commit atlanıyor."
-        
-        # Değişiklikleri repoya gönder
-        git push
+      - name: Değişiklikleri Commit ve Push Yap
+        run: |
+          git config --global user.name "GitHub Action"
+          git config --global user.email "action@github.com"
+          git add dizilla/dizilla.m3u
+          git commit -m "Dizilla M3U Güncellendi - $(date)" || echo "Değişiklik yok"
+          git push
