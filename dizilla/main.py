@@ -2,8 +2,9 @@ import json
 import base64
 import time
 import re
+import os
 from datetime import datetime
-from seleniumbase import SB
+from DrissionPage import ChromiumPage, ChromiumOptions
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import unpad
 from bs4 import BeautifulSoup
@@ -27,40 +28,54 @@ def decrypt_dizilla_response(encrypted_data):
     except:
         return None
 
-def extract_contentx(sb, url):
+def extract_contentx(page, url):
     try:
-        sb.open(url)
-        time.sleep(2) # Yüklenmesini bekle
-        source = sb.get_page_source()
+        tab = page.new_tab(url)
+        time.sleep(3)
         
-        match = re.search(r"window\.openPlayer\('([^']+)'", source)
+        # HTML kaynağını al
+        html = tab.html
+        match = re.search(r"window\.openPlayer\('([^']+)'", html)
+        
         if match:
             extract_id = match.group(1)
             source_url = f"https://contentx.me/source2.php?v={extract_id}"
-            sb.open(source_url)
+            tab.get(source_url)
             time.sleep(1)
-            vid_source = sb.get_page_source()
-            vid_match = re.search(r'file":"([^"]+)"', vid_source)
+            
+            vid_html = tab.html
+            vid_match = re.search(r'file":"([^"]+)"', vid_html)
+            
+            tab.close() # Sekmeyi kapat
             if vid_match:
                 return vid_match.group(1).replace("\\", "")
+        else:
+            tab.close()
     except Exception as e:
         log(f"ContentX hatası: {e}", "DEBUG")
+        try: tab.close() 
+        except: pass
     return None
 
-def process_episode(sb, episode_url):
+def process_episode(page, episode_url):
     try:
-        sb.open(episode_url)
-        # Cloudflare kontrolü varsa bekle
-        if "Just a moment" in sb.get_page_title():
-            log("Cloudflare kontrolü bekleniyor...", "WARNING")
-            time.sleep(6)
+        page.get(episode_url)
         
-        soup = BeautifulSoup(sb.get_page_source(), 'html.parser')
-        script = soup.find("script", id="__NEXT_DATA__")
+        # Cloudflare kontrolü
+        if "Just a moment" in page.title or "Access denied" in page.title:
+            log("Cloudflare engeli algılandı, bekleniyor...", "WARNING")
+            time.sleep(5)
+            # Turnstile iframe'i varsa tıkla (DrissionPage bazen otomatik geçer)
+            if page.ele("@class=cf-turnstile"):
+                log("Turnstile bulundu, tıklanıyor...", "INFO")
+                page.ele("@class=cf-turnstile").click()
+                time.sleep(5)
+
+        # __NEXT_DATA__ scriptini çek
+        script_text = page.ele("#__NEXT_DATA__").text
+        if not script_text: return None
         
-        if not script: return None
-        
-        data = json.loads(script.string)
+        data = json.loads(script_text)
         secure_data = data.get("props", {}).get("pageProps", {}).get("secureData", "")
         decrypted = decrypt_dizilla_response(secure_data)
         
@@ -80,7 +95,7 @@ def process_episode(sb, episode_url):
         if src.startswith("//"): src = "https:" + src
         
         if "contentx.me" in src or "hotlinger" in src:
-            return extract_contentx(sb, src)
+            return extract_contentx(page, src)
         
         return src
     except Exception as e:
@@ -88,69 +103,90 @@ def process_episode(sb, episode_url):
         return None
 
 def main():
-    # UC Mode: Undetected Chrome
-    # headless=False: Gerçek tarayıcı gibi davranması için (Xvfb ile sanal ekranda çalışacak)
-    with SB(uc=True, test=True, headless=False, locale_code="tr") as sb:
-        log("Tarayıcı başlatıldı (UC Mode).", "INFO")
+    # DrissionPage Ayarları
+    co = ChromiumOptions()
+    co.set_argument('--no-sandbox')
+    co.set_argument('--disable-gpu')
+    # Headless modunu KAPATIYORUZ (Xvfb içinde çalışacak)
+    # Bu sayede Cloudflare gerçek bir ekran görüyor.
+    
+    # Tarayıcıyı başlat
+    page = ChromiumPage(co)
+    
+    try:
+        log("DrissionPage Tarayıcı Başlatıldı.", "INFO")
         
         # 1. Ana Sayfaya Git
         url = f"{BASE_URL}/tum-bolumler"
-        sb.open(url)
+        page.get(url)
         
-        # Cloudflare Turnstile/Challenge kontrolü
-        log("Sayfa yükleniyor, Cloudflare kontrolü yapılıyor...", "INFO")
-        try:
-            # Eğer CF çıkarsa SeleniumBase otomatik tıklamayı dener
-            sb.uc_gui_click_captcha() 
-        except:
-            pass
+        # Cloudflare Bekleme Mantığı
+        for i in range(10):
+            title = page.title
+            if "Just a moment" in title or "Access denied" in title:
+                log(f"Cloudflare kontrolü sürüyor... ({i+1}/10)", "WARNING")
+                time.sleep(3)
+            else:
+                break
         
-        time.sleep(5) # Sayfanın tam oturmasını bekle
-        
-        if "Just a moment" in sb.get_page_title() or "Access denied" in sb.get_page_title():
+        if "Just a moment" in page.title:
             log("HATA: Cloudflare aşılamadı.", "CRITICAL")
-            # Sayfa kaynağını debug için yazdır
-            # print(sb.get_page_source()[:500])
+            # Sayfa kaynağını kaydet (Debug için)
+            # with open("debug.html", "w") as f: f.write(page.html)
+            page.quit()
             return
 
         log("Ana sayfaya erişildi!", "SUCCESS")
         
         # 2. Linkleri Topla
-        soup = BeautifulSoup(sb.get_page_source(), 'html.parser')
-        cards = soup.select("div.grid a[href*='/dizi/']")
+        # DrissionPage element seçicileri çok güçlüdür
+        cards = page.eles("css:div.grid a[href*='/dizi/']")
         
         items = []
         for card in cards[:15]: # İlk 15 bölüm
             try:
-                href = card.get("href")
+                href = card.attr("href")
                 full_url = f"{BASE_URL}{href}"
-                title = card.find("h2").text.strip()
-                ep_info = card.select_one("div.opacity-80").text.strip().replace(". Sezon ", "x").replace(". Bölüm", "")
+                
+                # HTML yapısını parse et
+                card_html = card.html
+                soup = BeautifulSoup(card_html, 'html.parser')
+                
+                title = soup.find("h2").text.strip()
+                ep_info = soup.select_one("div.opacity-80").text.strip().replace(". Sezon ", "x").replace(". Bölüm", "")
+                
                 items.append({"title": f"{title} - {ep_info}", "url": full_url, "category": "Yeni"})
             except: continue
             
         log(f"{len(items)} içerik bulundu. Linkler çözülüyor...", "INFO")
         
         # 3. M3U Oluştur
-        with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
-            f.write("#EXTM3U\n")
-            
-            for item in items:
-                log(f"İşleniyor: {item['title']}", "INFO")
-                stream_url = process_episode(sb, item["url"])
+        if items:
+            with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+                f.write("#EXTM3U\n")
                 
-                if stream_url:
-                    # User-Agent'ı tarayıcıdan al
-                    ua = sb.get_user_agent()
-                    final_url = f"{stream_url}|User-Agent={ua}" if ".m3u8" in stream_url else stream_url
+                for item in items:
+                    log(f"İşleniyor: {item['title']}", "INFO")
+                    stream_url = process_episode(page, item["url"])
                     
-                    f.write(f'#EXTINF:-1 group-title="{item["category"]}", {item["title"]}\n')
-                    f.write(f"{final_url}\n")
-                    log("Eklendi.", "SUCCESS")
-                else:
-                    log("Link bulunamadı.", "WARNING")
-                
-                time.sleep(1)
+                    if stream_url:
+                        ua = page.user_agent
+                        final_url = f"{stream_url}|User-Agent={ua}" if ".m3u8" in stream_url else stream_url
+                        
+                        f.write(f'#EXTINF:-1 group-title="{item["category"]}", {item["title"]}\n')
+                        f.write(f"{final_url}\n")
+                        log("Eklendi.", "SUCCESS")
+                    else:
+                        log("Link bulunamadı.", "WARNING")
+                    
+                    time.sleep(1)
+        else:
+            log("Hiç içerik bulunamadı.", "WARNING")
+
+    except Exception as e:
+        log(f"Genel Hata: {e}", "CRITICAL")
+    finally:
+        page.quit()
 
 if __name__ == "__main__":
     main()
