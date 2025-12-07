@@ -2,35 +2,41 @@ name: Dizilla M3U Scraper
 
 on:
   schedule:
-    - cron: '0 0 * * *' # Run daily at midnight UTC
-  workflow_dispatch: # Allows manual trigger
+    # Runs daily at midnight UTC
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+    # Allows manual triggering from the GitHub Actions tab
 
 jobs:
-  scrape:
+  scrape-and-commit:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write # Grant write permission to the GITHUB_TOKEN
-
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v3
-
-      - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/checkout@v4
         with:
-          python-version: '3.x'
+          # Required for git-auto-commit-action to commit to the current branch
+          token: ${{ secrets.GITHUB_TOKEN }} 
+          
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x' # Use the latest Python 3 version
 
       - name: Install dependencies
+        # CRITICAL: Path to requirements.txt is relative to the repository root
         run: pip install -r dizilla/requirements.txt
 
-      - name: Run scraper script
+      - name: Run Dizilla scraper
+        # CRITICAL: Path to scraper.py is relative to the repository root
         run: python dizilla/scraper.py
 
-      - name: Commit M3U file
-        uses: stefanzweifel/git-auto-commit-action@v4
+      - name: Commit updated M3U file
+        uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: "🤖 Update dizilla.m3u"
-          files: dizilla/dizilla.m3u
-          branch: ${{ github.ref_name }} # Commits to the current branch (e.g., main, master)
-          # You can specify 'main' or 'master' directly if you prefer:
-          # branch: main
+          # CRITICAL: Specify the file to commit within the 'dizilla' subdirectory
+          file_pattern: 'dizilla/dizilla.m3u'
+          commit_message: "Auto: Update dizilla.m3u"
+          # Optional: Configure commit user/email for clarity
+          commit_user_name: 'GitHub Actions Bot'
+          commit_user_email: 'actions@github.com'
+          commit_author: 'GitHub Actions Bot <actions@github.com>'
