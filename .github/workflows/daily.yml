@@ -1,36 +1,36 @@
-name: Generate Dizilla M3U
+name: Dizilla M3U Scraper
 
 on:
   schedule:
     - cron: '0 0 * * *' # Run daily at midnight UTC
-  workflow_dispatch: # Allows manual triggering
+  workflow_dispatch: # Allows manual trigger
 
 jobs:
-  scrape-and-commit:
+  scrape:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # Grant write permission to the GITHUB_TOKEN
+
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v3
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v4
         with:
-          python-version: '3.x' # Use the latest Python 3 version
+          python-version: '3.x'
 
       - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+        run: pip install -r dizilla/requirements.txt
 
       - name: Run scraper script
-        run: python scraper.py
+        run: python dizilla/scraper.py
 
       - name: Commit M3U file
-        uses: stefanzweifel/git-auto-commit-action@v5
+        uses: stefanzweifel/git-auto-commit-action@v4
         with:
-          commit_message: "feat: Update dizilla.m3u"
-          file_pattern: "dizilla/dizilla.m3u"
-          # Optional: You can specify a different branch to commit to
-          # branch: main # or master, etc.
-          # For public repositories, the GITHUB_TOKEN has write permissions by default.
-          # For private repositories, you might need to enable 'Write' permissions in Settings > Actions > General > Workflow permissions.
+          commit_message: "🤖 Update dizilla.m3u"
+          files: dizilla/dizilla.m3u
+          branch: ${{ github.ref_name }} # Commits to the current branch (e.g., main, master)
+          # You can specify 'main' or 'master' directly if you prefer:
+          # branch: main
