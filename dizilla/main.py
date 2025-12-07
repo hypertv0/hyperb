@@ -1,28 +1,34 @@
-import json
-import base64
-import time
+import cloudscraper
 import re
-import sys
+import base64
 import hashlib
-import random
-from datetime import datetime
-from curl_cffi import requests as crequests # Cloudflare bypass için özel istek kütüphanesi
-from DrissionPage import ChromiumPage, ChromiumOptions
-from Crypto.Cipher import AES
-from Crypto.Util.Padding import unpad
+import time
+import concurrent.futures
+import os
 from bs4 import BeautifulSoup
+from Crypto.Cipher import AES
 
 # --- AYARLAR ---
 BASE_URL = "https://www.dizibox.live"
-SITEMAP_URL = "https://www.dizibox.live/post-sitemap.xml"
-OUTPUT_FILE = "dizilla.m3u"
+OUTPUT_FILE = "dizibox.m3u"
+MAX_WORKERS = 10  # Aynı anda kaç bölüm taranacak (Hız için artırılabilir ama ban riski artar)
+MAX_PAGES = 500   # Kaç sayfa taranacağı (Tüm site için çok yüksek sayı verin örn: 5000)
 
-def log(message, level="INFO"):
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] [{level}] {message}")
-    sys.stdout.flush()
+# CloudScraper Kurulumu
+scraper = cloudscraper.create_scraper(
+    browser={'browser': 'chrome', 'platform': 'windows', 'mobile': False},
+    delay=10
+)
+# Gerekli çerezler (Sürekli değişebilir)
+scraper.cookies.update({
+    "LockUser": "true",
+    "isTrustedUser": "true",
+    "dbxu": "1744054959089"
+})
 
-# --- CRYPTOJS ŞİFRE ÇÖZME ---
 def bytes_to_key(data, salt, output=48):
+    """OpenSSL Key Derivation Function"""
+    data = data.encode('utf-8')
     data += salt
     key = hashlib.md5(data).digest()
     final_key = key
@@ -31,218 +37,148 @@ def bytes_to_key(data, salt, output=48):
         final_key += key
     return final_key[:output]
 
-def decrypt_cryptojs(passphrase, encrypted_base64):
+def decrypt_openssl(passphrase, encrypted_base64):
+    """AES Decryption"""
     try:
-        encrypted = base64.b64decode(encrypted_base64)
-        salt = encrypted[8:16]
-        ciphertext = encrypted[16:]
-        key_iv = bytes_to_key(passphrase.encode('utf-8'), salt, 32 + 16)
+        encrypted_data = base64.b64decode(encrypted_base64)
+        if encrypted_data[:8] != b'Salted__':
+            return None
+        salt = encrypted_data[8:16]
+        cipher_bytes = encrypted_data[16:]
+        key_iv = bytes_to_key(passphrase, salt, 48)
         key = key_iv[:32]
         iv = key_iv[32:]
         cipher = AES.new(key, AES.MODE_CBC, iv)
-        decrypted = unpad(cipher.decrypt(ciphertext), AES.block_size)
-        return decrypted.decode('utf-8')
-    except Exception as e:
+        decrypted = cipher.decrypt(cipher_bytes)
+        padding_len = decrypted[-1]
+        return decrypted[:-padding_len].decode('utf-8')
+    except Exception:
         return None
 
-# --- LİSTE OLUŞTURMA (curl_cffi ile) ---
-def fetch_sitemap_links():
-    log("Sitemap indiriliyor (curl_cffi)...", "INFO")
+def resolve_stream(episode_url, referer_url):
+    """Tek bir bölümün linkini çözer"""
     try:
-        # Gerçek bir Chrome tarayıcısı gibi davran
-        session = crequests.Session(impersonate="chrome120")
-        resp = session.get(SITEMAP_URL, timeout=15)
+        html = scraper.get(episode_url, headers={"Referer": referer_url}).text
+        soup = BeautifulSoup(html, 'html.parser')
         
-        if resp.status_code != 200:
-            log(f"Sitemap indirilemedi. Kod: {resp.status_code}", "ERROR")
-            return []
-            
-        # XML/HTML içeriğini parse et
-        soup = BeautifulSoup(resp.content, "html.parser") # XML yerine HTML parser daha esnek
+        iframe = soup.select_one("div#video-area iframe")
+        if not iframe: return None
         
-        links = []
-        # Sitemap yapısı: <loc>URL</loc> veya <a href="URL">
+        iframe_src = iframe.get("src", "").replace("php?v=", "php?wmode=opaque&v=")
         
-        # Önce loc etiketlerine bak (Standart XML)
-        locs = soup.find_all("loc")
-        for loc in locs:
-            url = loc.text.strip()
-            if "-izle" in url:
-                links.append(url)
-                
-        # Eğer loc yoksa (HTML sitemap ise), a etiketlerine bak
-        if not links:
-            as_tags = soup.find_all("a")
-            for a in as_tags:
-                href = a.get("href")
-                if href and "-izle" in href:
-                    links.append(href)
-                    
-        # Linkleri temizle ve formatla
-        formatted_items = []
-        for url in links:
-            # Başlığı URL'den çıkar
-            # .../dizi-adi-1-sezon-1-bolum-izle/
-            slug = url.rstrip("/").split("/")[-1].replace("-izle", "")
-            parts = slug.split("-")
-            
-            # Basit başlık oluşturma
-            title = slug.replace("-", " ").title()
-            
-            # Sezon/Bölüm bulmaya çalış
-            try:
-                if "sezon" in parts and "bolum" in parts:
-                    s_idx = parts.index("sezon")
-                    b_idx = parts.index("bolum")
-                    season = parts[s_idx-1]
-                    episode = parts[b_idx-1]
-                    # Dizi adını al
-                    name_parts = parts[:s_idx-1]
-                    name = " ".join(name_parts).title()
-                    title = f"{name} - {season}x{episode}"
-            except: pass
-            
-            formatted_items.append({
-                "title": title,
-                "url": url,
-                "category": "Son Eklenenler"
-            })
-            
-        # En yeni 30 bölümü al (Sitemap genelde eskiden yeniye veya karışıktır, ters çevirelim)
-        # DiziBox sitemap'i genelde en üstte en yeniyi tutar ama emin olalım.
-        return formatted_items[:30]
+        # 2. Aşama: Player Iframe
+        resp_player = scraper.get(iframe_src, headers={"Referer": episode_url})
+        soup_player = BeautifulSoup(resp_player.text, 'html.parser')
+        embed_iframe = soup_player.select_one("div#Player iframe")
+        
+        if not embed_iframe: return None
+        embed_url = embed_iframe.get("src", "")
+        
+        if "vidmoly" in embed_url:
+            embed_url = embed_url.replace("vidmoly.me", "vidmoly.net")
+            if "/embed/" in embed_url and "/sheila/" not in embed_url:
+                embed_url = embed_url.replace("/embed/", "/embed/sheila/")
+        
+        # 3. Aşama: Decryption
+        resp_embed = scraper.get(embed_url, headers={"Referer": iframe_src})
+        content = resp_embed.text
+        
+        # Direkt M3U8 var mı?
+        if "dbx.molystream" in embed_url:
+            for line in content.splitlines():
+                if line.startswith("http"): return line
 
-    except Exception as e:
-        log(f"Sitemap Hatası: {e}", "CRITICAL")
-        return []
-
-# --- VİDEO URL ÇIKARTMA (DrissionPage) ---
-def extract_video_url(page, episode_url):
-    try:
-        page.get(episode_url)
+        # Şifreli mi?
+        crypt_data = re.search(r'CryptoJS\.AES\.decrypt\(\"(.*?)\",\"', content)
+        crypt_pass = re.search(r'\",\"(.*?)\"\);', content)
         
-        # Cloudflare kontrolü
-        if "Just a moment" in page.title:
-            time.sleep(3)
-        
-        # 1. Iframe Bul
-        iframe_src = None
-        
-        # CSS ile
-        try:
-            iframe_ele = page.ele("css:div#video-area iframe")
-            if iframe_ele: iframe_src = iframe_ele.attr("src")
-        except: pass
-        
-        # Regex ile (HTML içinde)
-        if not iframe_src:
-            match = re.search(r'src="([^"]*king\.php[^"]*)"', page.html)
-            if match: iframe_src = match.group(1)
-            
-        if not iframe_src:
-            log("Player bulunamadı.", "WARNING")
-            return None
-            
-        if iframe_src.startswith("//"): iframe_src = "https:" + iframe_src
-        if "king.php" in iframe_src:
-            iframe_src = iframe_src.replace("king.php?v=", "king.php?wmode=opaque&v=")
-            
-        # 2. Player'a git
-        page.get(iframe_src)
-        time.sleep(1)
-        
-        # 3. Şifre Çözme
-        html = page.html
-        
-        # Senaryo A: Ana Player
-        match_data = re.search(r'CryptoJS\.AES\.decrypt\("([^"]+)",\s*"([^"]+)"\)', html)
-        if match_data:
-            decrypted = decrypt_cryptojs(match_data.group(2), match_data.group(1))
+        if crypt_data and crypt_pass:
+            decrypted = decrypt_openssl(crypt_pass.group(1), crypt_data.group(1))
             if decrypted:
-                file_match = re.search(r"file:\s*'([^']+)'", decrypted) or re.search(r'file:\s*"([^"]+)"', decrypted)
-                if file_match: return file_match.group(1)
-
-        # Senaryo B: İç Player (div#Player)
-        nested_match = re.search(r'<div id="Player">.*?<iframe.*?src="([^"]+)".*?>', html, re.DOTALL)
-        if nested_match:
-            nested_src = nested_match.group(1)
-            if nested_src.startswith("//"): nested_src = "https:" + nested_src
-            
-            page.get(nested_src)
-            time.sleep(1)
-            html = page.html
-            
-            match_data = re.search(r'CryptoJS\.AES\.decrypt\("([^"]+)",\s*"([^"]+)"\)', html)
-            if match_data:
-                decrypted = decrypt_cryptojs(match_data.group(2), match_data.group(1))
-                if decrypted:
-                    file_match = re.search(r"file:\s*'([^']+)'", decrypted) or re.search(r'file:\s*"([^"]+)"', decrypted)
-                    if file_match: return file_match.group(1)
-            
-            m3u8_match = re.search(r'file:\s*"([^"]+\.m3u8[^"]*)"', html)
-            if m3u8_match: return m3u8_match.group(1)
-
-        return None
-
+                match = re.search(r"file:\s*'(.*?)'", decrypted) or re.search(r'file:\s*"(.*?)"', decrypted)
+                if match: return match.group(1)
+                
     except Exception as e:
-        log(f"Hata: {e}", "ERROR")
-        return None
+        print(f"Hata ({episode_url}): {e}")
+    return None
+
+def process_episode(args):
+    """Thread içinde çalışacak fonksiyon"""
+    ep_name, ep_url, poster, category, series_name = args
+    stream_url = resolve_stream(ep_url, BASE_URL)
+    if stream_url:
+        return f'#EXTINF:-1 group-title="{category}" tvg-logo="{poster}", {series_name} - {ep_name}\n{stream_url}'
+    return None
 
 def main():
-    # 1. Linkleri Topla
-    items = fetch_sitemap_links()
+    print("DiziBox Tarayıcı Başlatıldı (Multi-Thread)...")
     
-    if not items:
-        log("Sitemap'ten link alınamadı. Manuel liste deneniyor...", "WARNING")
-        # Fallback: Eğer sitemap çalışmazsa en azından popüler dizileri ekle
-        items = [
-            {"title": "The Penguin - 1x1", "url": "https://www.dizibox.live/the-penguin-1-sezon-1-bolum-izle/", "category": "Fallback"},
-            {"title": "From - 3x1", "url": "https://www.dizibox.live/from-3-sezon-1-bolum-izle/", "category": "Fallback"}
-        ]
-
-    log(f"Toplam {len(items)} içerik işlenecek.", "SUCCESS")
-
-    # 2. Videoları Çek
-    co = ChromiumOptions()
-    co.set_argument('--no-sandbox')
-    co.set_argument('--disable-gpu')
-    co.set_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
+    # Kategori URL'leri (Hepsini taramak için burayı genişletin)
+    categories = [
+        ("Aksiyon", "aksiyon"), ("Komedi", "komedi"), 
+        ("Bilim Kurgu", "bilimkurgu"), ("Dram", "drama")
+    ]
     
-    page = ChromiumPage(co)
+    all_m3u_lines = ["#EXTM3U"]
     
-    # Cookie Ekle
-    page.set.cookies([
-        {'name': 'LockUser', 'value': 'true', 'domain': '.dizibox.live'},
-        {'name': 'isTrustedUser', 'value': 'true', 'domain': '.dizibox.live'},
-        {'name': 'dbxu', 'value': str(int(time.time() * 1000)), 'domain': '.dizibox.live'}
-    ])
-
-    try:
-        with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
-            f.write("#EXTM3U\n")
+    for cat_name, cat_slug in categories:
+        print(f"--- Kategori: {cat_name} ---")
+        for page in range(1, MAX_PAGES + 1):
+            url = f"{BASE_URL}/dizi-arsivi/page/{page}/?tur[0]={cat_slug}&yil&imdb"
+            print(f"Sayfa Taranıyor: {page} ({url})")
             
-            for item in items:
-                log(f"İşleniyor: {item['title']}", "INFO")
-                stream_url = extract_video_url(page, item["url"])
+            resp = scraper.get(url)
+            if resp.status_code != 200:
+                print("Sayfa sonuna gelindi veya engellendi.")
+                break
                 
-                if stream_url:
-                    ua = page.user_agent
-                    final_url = stream_url
-                    if ".m3u8" in stream_url:
-                        final_url = f"{stream_url}|User-Agent={ua}"
+            soup = BeautifulSoup(resp.text, 'html.parser')
+            articles = soup.select("article.detailed-article")
+            
+            if not articles: break
+            
+            episode_tasks = []
+            
+            for art in articles:
+                title_tag = art.select_one("h3 a")
+                img_tag = art.select_one("img")
+                if not title_tag: continue
+                
+                series_name = title_tag.text.strip()
+                series_href = title_tag['href']
+                poster = img_tag.get('data-src') or img_tag.get('src') or ""
+                
+                # Dizi sayfasına git ve son bölümü veya bölümleri al
+                # Hız kazanmak için sadece listelenen son bölümleri alıyoruz
+                # Eğer TÜM arşiv isteniyorsa dizi içine girip tüm sezonları döngüye sokmak gerekir
+                # Bu örnek ana sayfadaki listeleme mantığıyla çalışır.
+                
+                # Detaylı tarama için dizi sayfasına gir:
+                s_resp = scraper.get(series_href)
+                if s_resp.status_code == 200:
+                    s_soup = BeautifulSoup(s_resp.text, 'html.parser')
+                    episodes = s_soup.select("article.grid-box div.post-title a")
                     
-                    f.write(f'#EXTINF:-1 group-title="{item["category"]}", {item["title"]}\n')
-                    f.write(f"{final_url}\n")
-                    log("Eklendi.", "SUCCESS")
-                else:
-                    log("Stream bulunamadı.", "WARNING")
-                
-                time.sleep(1)
+                    for ep in episodes:
+                        ep_title = ep.text.strip()
+                        ep_href = ep['href']
+                        # Listeye ekle (Daha sonra thread ile işlenecek)
+                        episode_tasks.append((ep_title, ep_href, poster, cat_name, series_name))
 
-    except Exception as e:
-        log(f"Kritik Hata: {e}", "CRITICAL")
-    finally:
-        page.quit()
+            # ThreadPool ile sayfadaki tüm bölümleri aynı anda çöz
+            if episode_tasks:
+                print(f"  > {len(episode_tasks)} bölüm işleniyor...")
+                with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                    results = list(executor.map(process_episode, episode_tasks))
+                
+                # Sonuçları kaydet
+                for res in results:
+                    if res:
+                        all_m3u_lines.append(res)
+            
+            # M3U Dosyasını her sayfada güncelle (Crash durumuna karşı)
+            with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+                f.write("\n".join(all_m3u_lines))
 
 if __name__ == "__main__":
     main()
