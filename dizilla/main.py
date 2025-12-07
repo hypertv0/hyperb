@@ -5,8 +5,7 @@ import hashlib
 import time
 import subprocess
 import shutil
-import sys
-from bs4 import BeautifulSoup
+import os
 from Crypto.Cipher import AES
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
@@ -14,46 +13,45 @@ from selenium.webdriver.support import expected_conditions as EC
 
 # --- AYARLAR ---
 BASE_URL = "https://www.dizibox.live"
+# Sitenin tüm dizilerini barındıran harita
+SITEMAP_URL = "https://www.dizibox.live/tvseries-sitemap.xml" 
 OUTPUT_FILE = "dizibox.m3u"
 
-# Her kategoriden kaç sayfa taranacak? (Tüm site için 50+ yapın ama süre yetmeyebilir)
-MAX_PAGES_PER_CATEGORY = 2 
+# DİKKAT: Tüm siteyi çekmek günler sürer. 
+# Test için bu sayıyı düşük tutun (Örn: 5). Sınırsız için: 99999
+MAX_SERIES_LIMIT = 5 
 
-# İlk kodda olan kategoriler
-CATEGORIES = [
-    ("Popüler", "populer"), # Özel tip
-    ("Aksiyon", "aksiyon"),
-    ("Animasyon", "animasyon"),
-    ("Bilim Kurgu", "bilimkurgu"),
-    ("Dram", "drama"),
-    ("Komedi", "komedi"),
-    ("Suç", "suc")
-]
+# Her diziden kaç bölüm çekilsin? (0 = Hepsi)
+# Hız için '1' yaparsanız sadece son bölümü alır.
+MAX_EPISODES_PER_SERIES = 1 
 
-# --- TARAYICI AYARLARI ---
+def get_chrome_major_version():
+    try:
+        output = subprocess.check_output(['google-chrome', '--version'], stderr=subprocess.STDOUT)
+        version_str = output.decode('utf-8').strip()
+        match = re.search(r'Chrome (\d+)', version_str)
+        if match: return int(match.group(1))
+    except: pass
+    return None
+
 def get_driver():
     options = uc.ChromeOptions()
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--window-size=1920,1080")
-    # Masaüstü gibi görün
     options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36")
     
-    # Chrome yolunu bul
     chrome_path = shutil.which("google-chrome") or shutil.which("google-chrome-stable")
     if chrome_path: options.binary_location = chrome_path
 
-    # Versiyonu bul (Daha önceki hatayı önlemek için)
+    version = get_chrome_major_version()
     try:
-        output = subprocess.check_output(['google-chrome', '--version'], stderr=subprocess.STDOUT)
-        version = int(re.search(r'Chrome (\d+)', output.decode('utf-8')).group(1))
-        driver = uc.Chrome(options=options, version_main=version)
+        driver = uc.Chrome(options=options, version_main=version) if version else uc.Chrome(options=options)
     except:
-        driver = uc.Chrome(options=options) # Otomatik
-        
+        driver = uc.Chrome(options=options)
     return driver
 
-# --- ŞİFRE ÇÖZME (ESKİ KODDAN ALINDI) ---
+# --- ŞİFRE ÇÖZME ---
 def bytes_to_key(data, salt, output=48):
     data = data.encode('utf-8') + salt
     key = hashlib.md5(data).digest()
@@ -82,12 +80,7 @@ def resolve_stream(driver, episode_url):
     try:
         driver.get(episode_url)
         
-        # Cloudflare kontrolü
-        if "Just a moment" in driver.title:
-            WebDriverWait(driver, 20).until_not(EC.title_contains("Just a moment"))
-            time.sleep(2)
-
-        # Iframe bekle
+        # Video iframe'ini bekle
         try:
             WebDriverWait(driver, 5).until(
                 EC.presence_of_element_located((By.CSS_SELECTOR, "div#video-area iframe"))
@@ -97,11 +90,10 @@ def resolve_stream(driver, episode_url):
         iframe = driver.find_element(By.CSS_SELECTOR, "div#video-area iframe")
         src = iframe.get_attribute("src").replace("php?v=", "php?wmode=opaque&v=")
         
-        # Player sayfasına git
         driver.get(src)
         time.sleep(1)
         
-        # Embed linkini al (Vidmoly/Sheila)
+        # Player (Sheila/Vidmoly)
         try:
             embed = driver.find_element(By.CSS_SELECTOR, "div#Player iframe")
             embed_url = embed.get_attribute("src")
@@ -112,7 +104,6 @@ def resolve_stream(driver, episode_url):
             if "/embed/" in embed_url and "/sheila/" not in embed_url:
                 embed_url = embed_url.replace("/embed/", "/embed/sheila/")
         
-        # Şifre çözme sayfasına git
         driver.get(embed_url)
         time.sleep(0.5)
         src_code = driver.page_source
@@ -122,7 +113,7 @@ def resolve_stream(driver, episode_url):
             match = re.search(r'(https?://[^\s<"]+\.m3u8[^\s<"]*)', src_code)
             if match: return match.group(1)
 
-        # Şifreli Veri Ara
+        # Şifreli Ara
         crypt_data = re.search(r'CryptoJS\.AES\.decrypt\(\"(.*?)\",\"', src_code)
         crypt_pass = re.search(r'\",\"(.*?)\"\);', src_code)
         
@@ -131,124 +122,126 @@ def resolve_stream(driver, episode_url):
             if dec:
                 match = re.search(r"file:\s*'(.*?)'", dec) or re.search(r'file:\s*"(.*?)"', dec)
                 if match: return match.group(1)
-                
     except: pass
     return None
 
+def get_all_series_from_sitemap(driver):
+    """Sitemap üzerinden TÜM dizi linklerini çeker"""
+    print(f"Site Haritası Okunuyor: {SITEMAP_URL}")
+    driver.get(SITEMAP_URL)
+    time.sleep(5)
+    
+    # Sayfa kaynağındaki tüm URL'leri al (Regex ile)
+    # XML parse hatası almamak için metin olarak tarıyoruz
+    html = driver.page_source
+    # <loc>https://www.dizibox.live/diziler/dizi-adi/</loc> yapısını bul
+    urls = re.findall(r'<loc>(https://www.dizibox.live/diziler/[^<]+)</loc>', html)
+    
+    # Tekrarları temizle
+    unique_urls = list(set(urls))
+    print(f"Haritada {len(unique_urls)} adet dizi bulundu.")
+    return unique_urls
+
+def scrape_series(driver, series_url, all_m3u_lines):
+    """Bir dizinin içine girer, bilgileri alır ve bölümleri tarar"""
+    try:
+        driver.get(series_url)
+        
+        # Sayfanın yüklenmesini bekle
+        try:
+            WebDriverWait(driver, 5).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "h1.post-title"))
+            )
+        except:
+            # print("  ⚠️ Dizi sayfası yüklenemedi.")
+            return
+
+        # Metadata Çek (Sayfa kaynağından Regex veya CSS ile)
+        # Hız için JavaScript execute edebiliriz veya CSS
+        info = driver.execute_script("""
+            var title = document.querySelector('h1.post-title')?.innerText || 'Bilinmeyen Dizi';
+            var poster = document.querySelector('div.tv-poster img')?.getAttribute('src') || '';
+            var genre = document.querySelector('div.tv-poster-meta a')?.innerText || 'Genel';
+            // Bölüm linklerini topla (Sezonlar genelde gizlidir ama linkler HTML'dedir)
+            var links = [];
+            document.querySelectorAll('article.grid-box div.post-title a').forEach(a => {
+                links.push({text: a.innerText, href: a.href});
+            });
+            return {title: title, poster: poster, genre: genre, episodes: links};
+        """)
+        
+        series_title = info['title']
+        poster_url = info['poster']
+        category = info['genre']
+        episodes = info['episodes']
+        
+        if not episodes:
+            return
+
+        print(f"  > {series_title} ({len(episodes)} bölüm) - Kategori: {category}")
+        
+        # Limit kontrolü (Tüm bölümler mi, son bölüm mü?)
+        if MAX_EPISODES_PER_SERIES > 0:
+            episodes = episodes[:MAX_EPISODES_PER_SERIES]
+
+        for ep in episodes:
+            ep_title = ep['text']
+            ep_href = ep['href']
+            full_title = f"{series_title} - {ep_title}"
+            
+            # print(f"    Link Çözülüyor: {ep_title}")
+            m3u8 = resolve_stream(driver, ep_href)
+            
+            if m3u8:
+                print(f"    ✅ EKLENDİ: {ep_title}")
+                line = f'#EXTINF:-1 group-title="{category}" tvg-logo="{poster_url}", {full_title}\n{m3u8}'
+                all_m3u_lines.append(line)
+                
+                # Anlık Kayıt
+                with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+                    f.write("\n".join(all_m3u_lines))
+            else:
+                pass
+                # print("    ❌ Çözülemedi")
+
+    except Exception as e:
+        print(f"  Dizi hatası: {e}")
+
 def main():
-    print("DiziBox Full Crawler Başlatılıyor...")
+    print("DiziBox Tam Arşiv Tarayıcı (Sitemap Modu)...")
     driver = get_driver()
     all_m3u_lines = ["#EXTM3U"]
     
     try:
-        # 1. Giriş ve Cloudflare Geçişi
+        # 1. Siteye Isınma Turu
         driver.get(BASE_URL)
-        print("Siteye giriliyor...")
         time.sleep(5)
+        # Çerez
+        driver.add_cookie({"name": "LockUser", "value": "true", "domain": ".dizibox.live"})
+        driver.add_cookie({"name": "isTrustedUser", "value": "true", "domain": ".dizibox.live"})
         
-        # Çerezleri ekle (Opsiyonel ama hızlandırır)
-        cookies = [
-            {"name": "LockUser", "value": "true", "domain": ".dizibox.live"},
-            {"name": "isTrustedUser", "value": "true", "domain": ".dizibox.live"},
-            {"name": "dbxu", "value": "1744054959089", "domain": ".dizibox.live"}
-        ]
-        for c in cookies: 
-            try: driver.add_cookie(c)
-            except: pass
-        driver.refresh()
-        time.sleep(3)
+        # 2. Tüm Dizileri Al
+        series_list = get_all_series_from_sitemap(driver)
+        
+        if not series_list:
+            print("❌ Dizi listesi alınamadı! Site haritası engellenmiş olabilir.")
+            # Yedek: Ana sayfa linklerini topla
+            driver.get(BASE_URL)
+            html = driver.page_source
+            series_list = list(set(re.findall(r'href="(https://www.dizibox.live/diziler/[^"]+)"', html)))
+            print(f"Yedek: Ana sayfadan {len(series_list)} dizi bulundu.")
 
-        # 2. Kategorileri Gez
-        for cat_name, cat_slug in CATEGORIES:
-            print(f"\n=== KATEGORİ: {cat_name} ===")
+        # Limit uygula (Tüm siteyi taramak istemiyorsanız)
+        if MAX_SERIES_LIMIT > 0:
+            series_list = series_list[:MAX_SERIES_LIMIT]
             
-            for page in range(1, MAX_PAGES_PER_CATEGORY + 1):
-                # URL Oluşturma (Eski koddaki mantık)
-                if cat_slug == "populer":
-                    url = f"{BASE_URL}/tum-bolumler/page/{page}/?tip=populer"
-                else:
-                    url = f"{BASE_URL}/dizi-arsivi/page/{page}/?tur[0]={cat_slug}&yil&imdb"
-                
-                print(f"  Sayfa {page} taranıyor: {url}")
-                driver.get(url)
-                
-                # Cloudflare kontrolü
-                if "Just a moment" in driver.title:
-                    print("  ⚠️ Cloudflare engeli, bekleniyor...")
-                    try:
-                        WebDriverWait(driver, 15).until_not(EC.title_contains("Just a moment"))
-                        time.sleep(2)
-                    except:
-                        print("  ❌ Engel geçilemedi, sonraki sayfaya.")
-                        continue
-
-                # Dizi Kartlarını Bul
-                soup = BeautifulSoup(driver.page_source, 'html.parser')
-                # Hem arşiv hem popüler sayfası için farklı seçiciler
-                cards = soup.select("article.detailed-article") or soup.select("article.grid-box")
-                
-                if not cards:
-                    print("  ⚠️ Dizi bulunamadı (Sayfa boş veya yapı değişmiş).")
-                    break # Diğer sayfaya geçme, kategori bitmiş olabilir
-
-                print(f"  > {len(cards)} dizi bulundu.")
-
-                for card in cards:
-                    # Dizi Linkini ve Başlığını Al
-                    link_tag = card.select_one("h3 a") or card.select_one("div.post-title a") or card.select_one("a.figure-link")
-                    
-                    if not link_tag: continue
-                    
-                    series_name = link_tag.text.strip()
-                    series_href = link_tag.get('href')
-                    
-                    # Posteri al
-                    img_tag = card.select_one("img")
-                    poster_url = ""
-                    if img_tag:
-                        poster_url = img_tag.get("data-src") or img_tag.get("src") or ""
-
-                    print(f"    > Dizi İnceleniyor: {series_name}")
-                    
-                    # Dizi Sayfasına Git
-                    driver.get(series_href)
-                    time.sleep(2)
-                    
-                    # Dizi Sayfasındaki Bölümleri Bul
-                    # DiziBox dizi sayfasında bölümler genelde sezonlar halindedir
-                    s_soup = BeautifulSoup(driver.page_source, 'html.parser')
-                    episodes = s_soup.select("article.grid-box div.post-title a")
-                    
-                    # Eğer çok fazla bölüm varsa sadece son 3 tanesini al (Hız için)
-                    # Hepsini isterseniz [:3] kısmını silin.
-                    # episodes = episodes[:3] 
-                    
-                    if not episodes:
-                        print("      Bölüm listesi bulunamadı.")
-                        continue
-
-                    print(f"      {len(episodes)} bölüm var. Linkler çözülüyor...")
-
-                    for ep_link in episodes:
-                        ep_title = ep_link.text.strip()
-                        ep_href = ep_link.get('href')
-                        full_title = f"{series_name} - {ep_title}"
-                        
-                        # Bölüm Linkini Çöz
-                        m3u8 = resolve_stream(driver, ep_href)
-                        
-                        if m3u8:
-                            print(f"      ✅ EKLENDİ: {ep_title}")
-                            line = f'#EXTINF:-1 group-title="{cat_name}" tvg-logo="{poster_url}", {full_title}\n{m3u8}'
-                            all_m3u_lines.append(line)
-                            
-                            # Dosyayı kaydet
-                            with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
-                                f.write("\n".join(all_m3u_lines))
-                        else:
-                            # print("      ❌ Link çözülemedi.")
-                            pass
-                            
+        print(f"Toplam {len(series_list)} dizi işlenecek.")
+        
+        # 3. Sırayla işle
+        for i, url in enumerate(series_list):
+            print(f"[{i+1}/{len(series_list)}] İşleniyor...")
+            scrape_series(driver, url, all_m3u_lines)
+            
     except Exception as e:
         print(f"Genel Hata: {e}")
     finally:
