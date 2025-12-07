@@ -1,33 +1,35 @@
-import cloudscraper
+import undetected_chromedriver as uc
 import re
 import base64
 import hashlib
 import time
-import concurrent.futures
+import json
 import os
 from bs4 import BeautifulSoup
 from Crypto.Cipher import AES
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 
 # --- AYARLAR ---
 BASE_URL = "https://www.dizibox.live"
 OUTPUT_FILE = "dizibox.m3u"
-MAX_WORKERS = 10  # Aynı anda kaç bölüm taranacak (Hız için artırılabilir ama ban riski artar)
-MAX_PAGES = 500   # Kaç sayfa taranacağı (Tüm site için çok yüksek sayı verin örn: 5000)
+MAX_PAGES = 2   # Test için düşük tutun, çalışırsa artırırsınız.
 
-# CloudScraper Kurulumu
-scraper = cloudscraper.create_scraper(
-    browser={'browser': 'chrome', 'platform': 'windows', 'mobile': False},
-    delay=10
-)
-# Gerekli çerezler (Sürekli değişebilir)
-scraper.cookies.update({
-    "LockUser": "true",
-    "isTrustedUser": "true",
-    "dbxu": "1744054959089"
-})
+def get_driver():
+    """Cloudflare'i geçen özel Chrome tarayıcısı oluşturur"""
+    options = uc.ChromeOptions()
+    # GitHub Actions linux ortamında GUI olmadığı için bu ayarlar şart
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    # Headless modu bazen yakalanır, xvfb ile sanal ekran kullanacağız (YAML dosyasında)
+    # options.add_argument("--headless=new") 
+    
+    driver = uc.Chrome(options=options, version_main=None)
+    return driver
 
 def bytes_to_key(data, salt, output=48):
-    """OpenSSL Key Derivation Function"""
+    """OpenSSL Key Derivation"""
     data = data.encode('utf-8')
     data += salt
     key = hashlib.md5(data).digest()
@@ -55,40 +57,48 @@ def decrypt_openssl(passphrase, encrypted_base64):
     except Exception:
         return None
 
-def resolve_stream(episode_url, referer_url):
-    """Tek bir bölümün linkini çözer"""
+def resolve_stream(driver, episode_url):
+    """Bölüm linkini çözer (Driver nesnesini kullanır)"""
     try:
-        html = scraper.get(episode_url, headers={"Referer": referer_url}).text
-        soup = BeautifulSoup(html, 'html.parser')
+        print(f"    > Link çözülüyor: {episode_url}")
+        driver.get(episode_url)
+        time.sleep(3) # Sayfanın ve JS'in yüklenmesi için bekle
         
-        iframe = soup.select_one("div#video-area iframe")
-        if not iframe: return None
+        # 1. Iframe bul
+        try:
+            iframe = driver.find_element(By.CSS_SELECTOR, "div#video-area iframe")
+            iframe_src = iframe.get_attribute("src").replace("php?v=", "php?wmode=opaque&v=")
+        except:
+            return None
+
+        # 2. Player Iframe'e git
+        driver.get(iframe_src)
+        time.sleep(2)
         
-        iframe_src = iframe.get("src", "").replace("php?v=", "php?wmode=opaque&v=")
-        
-        # 2. Aşama: Player Iframe
-        resp_player = scraper.get(iframe_src, headers={"Referer": episode_url})
-        soup_player = BeautifulSoup(resp_player.text, 'html.parser')
-        embed_iframe = soup_player.select_one("div#Player iframe")
-        
-        if not embed_iframe: return None
-        embed_url = embed_iframe.get("src", "")
-        
+        try:
+            embed_iframe = driver.find_element(By.CSS_SELECTOR, "div#Player iframe")
+            embed_url = embed_iframe.get_attribute("src")
+        except:
+            return None
+            
         if "vidmoly" in embed_url:
             embed_url = embed_url.replace("vidmoly.me", "vidmoly.net")
             if "/embed/" in embed_url and "/sheila/" not in embed_url:
                 embed_url = embed_url.replace("/embed/", "/embed/sheila/")
         
-        # 3. Aşama: Decryption
-        resp_embed = scraper.get(embed_url, headers={"Referer": iframe_src})
-        content = resp_embed.text
+        # 3. Decryption Sayfası
+        driver.get(embed_url)
+        time.sleep(1)
+        content = driver.page_source
         
-        # Direkt M3U8 var mı?
+        # Direkt M3U8
         if "dbx.molystream" in embed_url:
             for line in content.splitlines():
-                if line.startswith("http"): return line
+                if "http" in line and ".m3u8" in line: # HTML taglerini temizle
+                    clean_link = re.search(r'(https?://[^\s<"]+)', line)
+                    if clean_link: return clean_link.group(1)
 
-        # Şifreli mi?
+        # Şifreli
         crypt_data = re.search(r'CryptoJS\.AES\.decrypt\(\"(.*?)\",\"', content)
         crypt_pass = re.search(r'\",\"(.*?)\"\);', content)
         
@@ -99,86 +109,95 @@ def resolve_stream(episode_url, referer_url):
                 if match: return match.group(1)
                 
     except Exception as e:
-        print(f"Hata ({episode_url}): {e}")
-    return None
-
-def process_episode(args):
-    """Thread içinde çalışacak fonksiyon"""
-    ep_name, ep_url, poster, category, series_name = args
-    stream_url = resolve_stream(ep_url, BASE_URL)
-    if stream_url:
-        return f'#EXTINF:-1 group-title="{category}" tvg-logo="{poster}", {series_name} - {ep_name}\n{stream_url}'
+        print(f"    ! Hata: {e}")
     return None
 
 def main():
-    print("DiziBox Tarayıcı Başlatıldı (Multi-Thread)...")
+    print("DiziBox Tarayıcı Başlatılıyor (Selenium Mode)...")
     
-    # Kategori URL'leri (Hepsini taramak için burayı genişletin)
+    driver = get_driver()
+    
+    # DiziBox'a ilk giriş ve cookie ayarı
+    try:
+        driver.get(BASE_URL)
+        time.sleep(5) # Cloudflare kontrolünü geçmesi için bekle
+        
+        # Cookie ekle (Dizibox kodundaki trusted cookie'ler)
+        driver.add_cookie({"name": "LockUser", "value": "true", "domain": ".dizibox.live"})
+        driver.add_cookie({"name": "isTrustedUser", "value": "true", "domain": ".dizibox.live"})
+        driver.add_cookie({"name": "dbxu", "value": "1744054959089", "domain": ".dizibox.live"})
+        driver.refresh()
+        time.sleep(3)
+        
+    except Exception as e:
+        print("Siteye erişilemedi:", e)
+        driver.quit()
+        return
+
     categories = [
-        ("Aksiyon", "aksiyon"), ("Komedi", "komedi"), 
-        ("Bilim Kurgu", "bilimkurgu"), ("Dram", "drama")
+        ("Aksiyon", "aksiyon"),
+        # ("Komedi", "komedi"), # Test için kapalı, açabilirsiniz
     ]
     
     all_m3u_lines = ["#EXTM3U"]
     
-    for cat_name, cat_slug in categories:
-        print(f"--- Kategori: {cat_name} ---")
-        for page in range(1, MAX_PAGES + 1):
-            url = f"{BASE_URL}/dizi-arsivi/page/{page}/?tur[0]={cat_slug}&yil&imdb"
-            print(f"Sayfa Taranıyor: {page} ({url})")
-            
-            resp = scraper.get(url)
-            if resp.status_code != 200:
-                print("Sayfa sonuna gelindi veya engellendi.")
-                break
+    try:
+        for cat_name, cat_slug in categories:
+            print(f"--- Kategori: {cat_name} ---")
+            for page in range(1, MAX_PAGES + 1):
+                url = f"{BASE_URL}/dizi-arsivi/page/{page}/?tur[0]={cat_slug}&yil&imdb"
+                print(f"Sayfa Taranıyor: {page}")
                 
-            soup = BeautifulSoup(resp.text, 'html.parser')
-            articles = soup.select("article.detailed-article")
-            
-            if not articles: break
-            
-            episode_tasks = []
-            
-            for art in articles:
-                title_tag = art.select_one("h3 a")
-                img_tag = art.select_one("img")
-                if not title_tag: continue
+                driver.get(url)
+                time.sleep(3)
                 
-                series_name = title_tag.text.strip()
-                series_href = title_tag['href']
-                poster = img_tag.get('data-src') or img_tag.get('src') or ""
-                
-                # Dizi sayfasına git ve son bölümü veya bölümleri al
-                # Hız kazanmak için sadece listelenen son bölümleri alıyoruz
-                # Eğer TÜM arşiv isteniyorsa dizi içine girip tüm sezonları döngüye sokmak gerekir
-                # Bu örnek ana sayfadaki listeleme mantığıyla çalışır.
-                
-                # Detaylı tarama için dizi sayfasına gir:
-                s_resp = scraper.get(series_href)
-                if s_resp.status_code == 200:
-                    s_soup = BeautifulSoup(s_resp.text, 'html.parser')
-                    episodes = s_soup.select("article.grid-box div.post-title a")
-                    
-                    for ep in episodes:
-                        ep_title = ep.text.strip()
-                        ep_href = ep['href']
-                        # Listeye ekle (Daha sonra thread ile işlenecek)
-                        episode_tasks.append((ep_title, ep_href, poster, cat_name, series_name))
+                if "Just a moment" in driver.title or "Access denied" in driver.title:
+                    print("Cloudflare Engelini Geçemedik! Sayfa atlanıyor.")
+                    continue
 
-            # ThreadPool ile sayfadaki tüm bölümleri aynı anda çöz
-            if episode_tasks:
-                print(f"  > {len(episode_tasks)} bölüm işleniyor...")
-                with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-                    results = list(executor.map(process_episode, episode_tasks))
+                soup = BeautifulSoup(driver.page_source, 'html.parser')
+                articles = soup.select("article.detailed-article")
                 
-                # Sonuçları kaydet
-                for res in results:
-                    if res:
-                        all_m3u_lines.append(res)
-            
-            # M3U Dosyasını her sayfada güncelle (Crash durumuna karşı)
-            with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
-                f.write("\n".join(all_m3u_lines))
+                if not articles:
+                    print("Bu sayfada içerik yok.")
+                    break
+                
+                for art in articles:
+                    title_tag = art.select_one("h3 a")
+                    img_tag = art.select_one("img")
+                    if not title_tag: continue
+                    
+                    series_name = title_tag.text.strip()
+                    series_href = title_tag['href']
+                    poster = img_tag.get('data-src') or img_tag.get('src') or ""
+                    
+                    # Dizi detayına gitmeden hızlıca listeyi almayı dene (Varsa)
+                    # Yoksa dizi içine girip son bölümü alacağız
+                    print(f"  > Dizi: {series_name}")
+                    
+                    # Dizi sayfasına git
+                    driver.get(series_href)
+                    time.sleep(2)
+                    s_soup = BeautifulSoup(driver.page_source, 'html.parser')
+                    
+                    # Son eklenen bölümü al (Sadece en üstteki 1 tanesi, hız için)
+                    first_ep = s_soup.select_one("article.grid-box div.post-title a")
+                    
+                    if first_ep:
+                        ep_title = first_ep.text.strip()
+                        ep_href = first_ep['href']
+                        
+                        stream_url = resolve_stream(driver, ep_href)
+                        if stream_url:
+                            line = f'#EXTINF:-1 group-title="{cat_name}" tvg-logo="{poster}", {series_name} - {ep_title}\n{stream_url}'
+                            all_m3u_lines.append(line)
+                            
+                            # Her başarılı linkte dosyayı güncelle
+                            with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+                                f.write("\n".join(all_m3u_lines))
+    finally:
+        driver.quit()
+        print("Tarama bitti.")
 
 if __name__ == "__main__":
     main()
