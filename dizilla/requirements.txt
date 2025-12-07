@@ -1,5 +1,2 @@
-undetected-chromedriver
-beautifulsoup4
-pycryptodome
-selenium
 requests
+beautifulsoup4
