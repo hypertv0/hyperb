@@ -2,9 +2,8 @@ name: Dizilla Günlük Güncelleme
 
 on:
   schedule:
-    # Her gün gece 03:00'te çalışır (UTC)
     - cron: '0 3 * * *'
-  workflow_dispatch: # Manuel çalıştırma butonu ekler
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -14,7 +13,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - name: Depoyu Çek (Checkout)
+    - name: Depoyu Çek
       uses: actions/checkout@v3
 
     - name: Python Kurulumu
@@ -22,21 +21,25 @@ jobs:
       with:
         python-version: '3.9'
 
+    # Chrome ve Xvfb Kurulumu (Ekransız sunucuda tarayıcı çalıştırmak için)
+    - name: Google Chrome ve Xvfb Kur
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y google-chrome-stable xvfb
+
     - name: Kütüphaneleri Yükle
       run: |
         pip install -r dizilla/requirements.txt
 
-    - name: Scraper Kodunu Çalıştır
-      # Dizilla klasörüne girip kodu çalıştırır
+    - name: Scraper'ı Çalıştır (Sanal Ekran ile)
       run: |
         cd dizilla
-        python main.py
+        # xvfb-run komutu sahte bir monitör oluşturur
+        xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24" python main.py
 
-    - name: Değişiklikleri Commit ve Push Yap
+    - name: Commit ve Push
       run: |
         git config --global user.name "GitHub Action"
         git config --global user.email "action@github.com"
-        
-        # Sadece m3u dosyası değişmişse commit at
         git add dizilla/dizibox.m3u
-        git diff --quiet && git diff --staged --quiet || (git commit -m "Otomatik M3U Güncellemesi: $(date)" && git push)
+        git diff --quiet && git diff --staged --quiet || (git commit -m "M3U Güncelleme" && git push)
