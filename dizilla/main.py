@@ -14,14 +14,15 @@ from selenium.webdriver.support import expected_conditions as EC
 
 # --- AYARLAR ---
 BASE_URL = "https://www.dizibox.live"
+# Güvenilir Kaynak: Son Eklenen Bölümler Sayfası
+TARGET_URL = "https://www.dizibox.live/tum-bolumler/page/{}/"
 OUTPUT_FILE = "dizibox.m3u"
-MAX_PAGES = 3
+MAX_PAGES = 3  # Her gün son 3 sayfayı (yaklaşık 60-90 bölüm) tarar
 
 def get_chrome_major_version():
     try:
         output = subprocess.check_output(['google-chrome', '--version'], stderr=subprocess.STDOUT)
         version_str = output.decode('utf-8').strip()
-        print(f"Sistemdeki Chrome: {version_str}")
         match = re.search(r'Chrome (\d+)', version_str)
         if match: return int(match.group(1))
     except: pass
@@ -70,30 +71,45 @@ def decrypt_openssl(passphrase, encrypted_base64):
         return decrypted[:-decrypted[-1]].decode('utf-8')
     except: return None
 
-# --- STREAM ÇÖZÜCÜ ---
-def resolve_stream(driver, episode_url):
+# --- STREAM VE KATEGORİ ÇÖZÜCÜ ---
+def resolve_episode_details(driver, episode_url):
+    """Hem video linkini hem de kategoriyi çeker"""
+    details = {"stream": None, "category": "Genel", "poster": ""}
+    
     try:
-        print(f"    > Link çözülüyor: {episode_url}")
         driver.get(episode_url)
         
-        # Video alanını bekle
+        # Cloudflare bekleme
         try:
-            WebDriverWait(driver, 8).until(
+            WebDriverWait(driver, 10).until(
                 EC.presence_of_element_located((By.CSS_SELECTOR, "div#video-area iframe"))
             )
         except:
             return None
 
+        # 1. Kategoriyi Bul (Breadcrumb veya Etiketlerden)
+        soup = BeautifulSoup(driver.page_source, 'html.parser')
+        
+        # Poster bul
+        poster_tag = soup.select_one("div.tv-poster img") or soup.select_one("img.wp-post-image")
+        if poster_tag:
+            details["poster"] = poster_tag.get("src") or poster_tag.get("data-src") or ""
+
+        # Kategori bul (Genelde 'tur' linkleri)
+        cat_tags = soup.select("a[href*='/tur/']")
+        if cat_tags:
+            # İlk bulunan türü al (Örn: Aksiyon)
+            details["category"] = cat_tags[0].text.strip()
+
+        # 2. Video Linkini Çöz
         iframe = driver.find_element(By.CSS_SELECTOR, "div#video-area iframe")
         src = iframe.get_attribute("src").replace("php?v=", "php?wmode=opaque&v=")
         
         driver.get(src)
         time.sleep(1.5)
         
-        try:
-            embed = driver.find_element(By.CSS_SELECTOR, "div#Player iframe")
-            embed_url = embed.get_attribute("src")
-        except: return None
+        embed = driver.find_element(By.CSS_SELECTOR, "div#Player iframe")
+        embed_url = embed.get_attribute("src")
             
         if "vidmoly" in embed_url:
             embed_url = embed_url.replace("vidmoly.me", "vidmoly.net")
@@ -108,7 +124,7 @@ def resolve_stream(driver, episode_url):
             for line in src_code.splitlines():
                 if "http" in line and "m3u8" in line:
                     match = re.search(r'(https?://[^\s<"]+)', line)
-                    if match: return match.group(1)
+                    if match: details["stream"] = match.group(1)
 
         crypt_data = re.search(r'CryptoJS\.AES\.decrypt\(\"(.*?)\",\"', src_code)
         crypt_pass = re.search(r'\",\"(.*?)\"\);', src_code)
@@ -117,30 +133,24 @@ def resolve_stream(driver, episode_url):
             dec = decrypt_openssl(crypt_pass.group(1), crypt_data.group(1))
             if dec:
                 match = re.search(r"file:\s*'(.*?)'", dec) or re.search(r'file:\s*"(.*?)"', dec)
-                if match: return match.group(1)
+                if match: details["stream"] = match.group(1)
+                
     except Exception as e:
-        print(f"    ! Hata: {e}")
-    return None
-
-def check_cloudflare(driver):
-    title = driver.title
-    if "Just a moment" in title or "Cloudflare" in title:
-        print(f"⚠️ Cloudflare. Bekleniyor...")
-        try:
-            WebDriverWait(driver, 15).until_not(EC.title_contains("Just a moment"))
-            time.sleep(2)
-        except: return False
-    return True
+        print(f"    ! Detay hatası: {e}")
+    
+    return details
 
 def main():
-    print("DiziBox Tarayıcı Başlatılıyor (Düzeltilmiş Seçiciler)...")
+    print("DiziBox Tarayıcı Başlatılıyor (Tüm Bölümler Modu)...")
     driver = get_driver()
+    
+    # M3U Dosyasını sıfırla veya oku (Burada sıfırlıyoruz)
+    all_m3u_lines = ["#EXTM3U"]
 
     try:
+        # Siteye bir kere girip çerezleri ayarla
         driver.get(BASE_URL)
-        check_cloudflare(driver)
-        
-        # Çerezler
+        time.sleep(5)
         cookies = [
             {"name": "LockUser", "value": "true", "domain": ".dizibox.live"},
             {"name": "isTrustedUser", "value": "true", "domain": ".dizibox.live"},
@@ -150,90 +160,71 @@ def main():
             try: driver.add_cookie(c)
             except: pass
         driver.refresh()
-        check_cloudflare(driver)
-        
-        categories = [("Aksiyon", "aksiyon"), ("Komedi", "komedi"), ("Bilim Kurgu", "bilimkurgu")]
-        all_m3u_lines = ["#EXTM3U"]
-        
-        for cat_name, cat_slug in categories:
-            print(f"\n--- Kategori: {cat_name} ---")
-            for page in range(1, MAX_PAGES + 1):
-                url = f"{BASE_URL}/dizi-arsivi/page/{page}/?tur[0]={cat_slug}&yil&imdb"
-                print(f"Linke gidiliyor: {url}")
-                
-                driver.get(url)
-                check_cloudflare(driver)
 
-                # Ana sayfaya attı mı kontrol et
-                if driver.current_url.rstrip('/') == BASE_URL.rstrip('/'):
-                    print("⚠️ Site Ana Sayfaya yönlendirdi (Filtre geçersiz olabilir).")
-                    break
+        # Sayfaları Tara
+        for page in range(1, MAX_PAGES + 1):
+            url = TARGET_URL.format(page)
+            print(f"\n--- Sayfa {page} Taranıyor: {url} ---")
+            
+            driver.get(url)
+            time.sleep(3)
+            
+            # İçeriğin yüklenmesini bekle
+            try:
+                WebDriverWait(driver, 10).until(
+                    EC.presence_of_element_located((By.TAG_NAME, "article"))
+                )
+            except:
+                print("⚠️ İçerik yüklenemedi, diğer sayfaya geçiliyor.")
+                continue
 
-                # DOĞRU SEÇİCİLER (Grid Box veya Detailed Article)
+            # Sayfadaki tüm bölüm linklerini bul (Href içinde '-izle' geçenler)
+            # Bu en güvenli yöntemdir çünkü CSS classları değişebilir ama link yapısı zor değişir.
+            links = driver.find_elements(By.XPATH, "//article//a[contains(@href, '-izle')]")
+            
+            # Linkleri ve başlıkları topla (Stale element hatasını önlemek için önce listeye al)
+            episode_list = []
+            for link in links:
                 try:
-                    WebDriverWait(driver, 10).until(
-                        EC.presence_of_element_located((By.CSS_SELECTOR, "article.grid-box, article.detailed-article"))
-                    )
-                except:
-                    print(f"⚠️ İçerik yüklenemedi. Başlık: {driver.title}")
-                    break
-
-                soup = BeautifulSoup(driver.page_source, 'html.parser')
-                # Eklentideki mantık: article.detailed-article VEYA article.grid-box
-                articles = soup.select("article.detailed-article, article.grid-box")
+                    href = link.get_attribute("href")
+                    # Başlık genellikle linkin içindeki text veya title attribute'dur
+                    title = link.text.strip()
+                    if not title:
+                        title = link.get_attribute("title")
+                    
+                    if href and href not in [x[0] for x in episode_list]:
+                        episode_list.append((href, title))
+                except: pass
+            
+            print(f"  > {len(episode_list)} bölüm bulundu.")
+            
+            # Bulunan bölümleri tek tek gez
+            for href, title in episode_list:
+                print(f"  > İşleniyor: {title}")
                 
-                if not articles:
-                    print("Makale listesi boş.")
-                    break
+                details = resolve_episode_details(driver, href)
                 
-                print(f"  > {len(articles)} içerik bulundu.")
+                if details and details["stream"]:
+                    category = details["category"]
+                    poster = details["poster"]
+                    
+                    # Başlığı temizle (Varsa gereksiz boşlukları at)
+                    clean_title = title.replace("\n", " ").strip()
+                    if not clean_title: clean_title = "Bilinmeyen Bolum"
+                    
+                    print(f"    ✅ LİNK ALINDI ({category}): {clean_title}")
+                    
+                    line = f'#EXTINF:-1 group-title="{category}" tvg-logo="{poster}", {clean_title}\n{details["stream"]}'
+                    all_m3u_lines.append(line)
+                    
+                    # Her başarılı işlemde dosyayı kaydet
+                    with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+                        f.write("\n".join(all_m3u_lines))
+                else:
+                    print("    ❌ Stream bulunamadı.")
                 
-                for art in articles:
-                    # Başlık ve Link Bulma (Hem grid hem liste uyumlu)
-                    title_tag = art.select_one("h3 a") or art.select_one("div.post-title a") or art.select_one("a.figure-link")
-                    
-                    if not title_tag: continue
-                    
-                    series_name = title_tag.text.strip()
-                    # Eğer text boşsa (bazı temalarda sadece resim olur) alt attribute dene
-                    if not series_name:
-                        img_check = art.select_one("img")
-                        if img_check: series_name = img_check.get("alt", "Bilinmeyen Dizi")
-
-                    series_href = title_tag.get('href')
-                    
-                    poster_tag = art.select_one("img")
-                    poster_url = ""
-                    if poster_tag:
-                        poster_url = poster_tag.get('data-src') or poster_tag.get('src') or ""
-                    
-                    print(f"  > İnceleniyor: {series_name}")
-                    driver.get(series_href)
-                    check_cloudflare(driver)
-                    
-                    # Dizi sayfasında son bölümü bul
-                    try:
-                        WebDriverWait(driver, 5).until(
-                            EC.presence_of_element_located((By.CSS_SELECTOR, "article.grid-box"))
-                        )
-                        # Dizi sayfasındaki bölümler genelde article.grid-box içindedir
-                        ep_soup = BeautifulSoup(driver.page_source, 'html.parser')
-                        # İlk bölümü (genelde son eklenen) al
-                        ep_tag = ep_soup.select_one("article.grid-box div.post-title a")
-                        
-                        if ep_tag:
-                            full_title = f"{series_name} - {ep_tag.text.strip()}"
-                            m3u_link = resolve_stream(driver, ep_tag['href'])
-                            
-                            if m3u_link:
-                                print(f"    ✅ EKLENDİ: {full_title}")
-                                line = f'#EXTINF:-1 group-title="{cat_name}" tvg-logo="{poster_url}", {full_title}\n{m3u_link}'
-                                all_m3u_lines.append(line)
-                                with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
-                                    f.write("\n".join(all_m3u_lines))
-                    except Exception as e:
-                        # Dizi sayfası yüklenemezse geç
-                        pass
+                # Cloudflare'i kızdırmamak için kısa bekleme
+                # time.sleep(1)
 
     except Exception as e:
         print(f"Genel Hata: {e}")
