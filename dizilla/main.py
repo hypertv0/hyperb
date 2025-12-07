@@ -33,7 +33,6 @@ def get_driver():
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--window-size=1920,1080")
     
-    # Chrome yolunu zorla
     chrome_path = shutil.which("google-chrome") or shutil.which("google-chrome-stable")
     if chrome_path: options.binary_location = chrome_path
 
@@ -43,8 +42,7 @@ def get_driver():
             driver = uc.Chrome(options=options, version_main=version)
         else:
             driver = uc.Chrome(options=options)
-    except Exception as e:
-        print(f"Driver Hata: {e}, versiyonsuz deneniyor...")
+    except:
         driver = uc.Chrome(options=options)
     return driver
 
@@ -78,20 +76,19 @@ def resolve_stream(driver, episode_url):
         print(f"    > Link çözülüyor: {episode_url}")
         driver.get(episode_url)
         
-        # Video alanının yüklenmesini bekle
+        # Video alanını bekle
         try:
-            WebDriverWait(driver, 10).until(
+            WebDriverWait(driver, 8).until(
                 EC.presence_of_element_located((By.CSS_SELECTOR, "div#video-area iframe"))
             )
         except:
-            print("    ! Iframe bulunamadı (Zaman aşımı)")
             return None
 
         iframe = driver.find_element(By.CSS_SELECTOR, "div#video-area iframe")
         src = iframe.get_attribute("src").replace("php?v=", "php?wmode=opaque&v=")
         
         driver.get(src)
-        time.sleep(2) # Player yüklenmesi için kısa bekleme
+        time.sleep(1.5)
         
         try:
             embed = driver.find_element(By.CSS_SELECTOR, "div#Player iframe")
@@ -107,14 +104,12 @@ def resolve_stream(driver, episode_url):
         time.sleep(1)
         src_code = driver.page_source
         
-        # M3U8 Kontrol
         if "dbx.molystream" in embed_url:
             for line in src_code.splitlines():
                 if "http" in line and "m3u8" in line:
                     match = re.search(r'(https?://[^\s<"]+)', line)
                     if match: return match.group(1)
 
-        # AES Şifre Kontrol
         crypt_data = re.search(r'CryptoJS\.AES\.decrypt\(\"(.*?)\",\"', src_code)
         crypt_pass = re.search(r'\",\"(.*?)\"\);', src_code)
         
@@ -128,33 +123,24 @@ def resolve_stream(driver, episode_url):
     return None
 
 def check_cloudflare(driver):
-    """Cloudflare kontrolü ve bekleme"""
     title = driver.title
-    if "Just a moment" in title or "Cloudflare" in title or "Attention Required" in title:
-        print(f"⚠️ Cloudflare tespit edildi ({title}). Bekleniyor...")
+    if "Just a moment" in title or "Cloudflare" in title:
+        print(f"⚠️ Cloudflare. Bekleniyor...")
         try:
-            # 20 saniyeye kadar sayfanın başlığının değişmesini bekle
-            WebDriverWait(driver, 20).until_not(EC.title_contains("Just a moment"))
-            print("✅ Cloudflare geçildi!")
-            time.sleep(2) # Garanti olsun diye biraz daha bekle
-        except:
-            print("❌ Cloudflare geçilemedi!")
-            return False
+            WebDriverWait(driver, 15).until_not(EC.title_contains("Just a moment"))
+            time.sleep(2)
+        except: return False
     return True
 
 def main():
-    print("DiziBox Tarayıcı Başlatılıyor (Gelişmiş Bekleme Modu)...")
-    try:
-        driver = get_driver()
-    except Exception as e:
-        print(f"CRITICAL: {e}")
-        exit(1)
+    print("DiziBox Tarayıcı Başlatılıyor (Düzeltilmiş Seçiciler)...")
+    driver = get_driver()
 
     try:
         driver.get(BASE_URL)
         check_cloudflare(driver)
         
-        # Çerezleri ekle
+        # Çerezler
         cookies = [
             {"name": "LockUser", "value": "true", "domain": ".dizibox.live"},
             {"name": "isTrustedUser", "value": "true", "domain": ".dizibox.live"},
@@ -173,65 +159,84 @@ def main():
             print(f"\n--- Kategori: {cat_name} ---")
             for page in range(1, MAX_PAGES + 1):
                 url = f"{BASE_URL}/dizi-arsivi/page/{page}/?tur[0]={cat_slug}&yil&imdb"
-                print(f"Sayfa {page} yükleniyor: {url}")
+                print(f"Linke gidiliyor: {url}")
                 
                 driver.get(url)
-                if not check_cloudflare(driver):
-                    print("Sayfa atlanıyor (Cloudflare).")
-                    continue
-                
-                # İçeriğin yüklenmesini bekle (article etiketini bekle)
+                check_cloudflare(driver)
+
+                # Ana sayfaya attı mı kontrol et
+                if driver.current_url.rstrip('/') == BASE_URL.rstrip('/'):
+                    print("⚠️ Site Ana Sayfaya yönlendirdi (Filtre geçersiz olabilir).")
+                    break
+
+                # DOĞRU SEÇİCİLER (Grid Box veya Detailed Article)
                 try:
                     WebDriverWait(driver, 10).until(
-                        EC.presence_of_element_located((By.CSS_SELECTOR, "article.detailed-article"))
+                        EC.presence_of_element_located((By.CSS_SELECTOR, "article.grid-box, article.detailed-article"))
                     )
                 except:
-                    print("⚠️ İçerik bulunamadı veya süre doldu. Sayfa Başlığı:", driver.title)
-                    # Eğer içerik yoksa bu kategori bitmiş olabilir
+                    print(f"⚠️ İçerik yüklenemedi. Başlık: {driver.title}")
                     break
 
                 soup = BeautifulSoup(driver.page_source, 'html.parser')
-                articles = soup.select("article.detailed-article")
+                # Eklentideki mantık: article.detailed-article VEYA article.grid-box
+                articles = soup.select("article.detailed-article, article.grid-box")
                 
                 if not articles:
                     print("Makale listesi boş.")
                     break
                 
-                print(f"  > {len(articles)} dizi bulundu.")
+                print(f"  > {len(articles)} içerik bulundu.")
                 
                 for art in articles:
-                    title_tag = art.select_one("h3 a")
-                    if not title_tag: continue
-                    series_name = title_tag.text.strip()
-                    series_href = title_tag['href']
-                    poster = art.select_one("img")
-                    poster_url = poster.get('data-src') or poster.get('src') or ""
+                    # Başlık ve Link Bulma (Hem grid hem liste uyumlu)
+                    title_tag = art.select_one("h3 a") or art.select_one("div.post-title a") or art.select_one("a.figure-link")
                     
-                    print(f"  > Dizi İnceleniyor: {series_name}")
+                    if not title_tag: continue
+                    
+                    series_name = title_tag.text.strip()
+                    # Eğer text boşsa (bazı temalarda sadece resim olur) alt attribute dene
+                    if not series_name:
+                        img_check = art.select_one("img")
+                        if img_check: series_name = img_check.get("alt", "Bilinmeyen Dizi")
+
+                    series_href = title_tag.get('href')
+                    
+                    poster_tag = art.select_one("img")
+                    poster_url = ""
+                    if poster_tag:
+                        poster_url = poster_tag.get('data-src') or poster_tag.get('src') or ""
+                    
+                    print(f"  > İnceleniyor: {series_name}")
                     driver.get(series_href)
                     check_cloudflare(driver)
                     
-                    # Son bölümü bul
+                    # Dizi sayfasında son bölümü bul
                     try:
                         WebDriverWait(driver, 5).until(
                             EC.presence_of_element_located((By.CSS_SELECTOR, "article.grid-box"))
                         )
-                        ep_tag = BeautifulSoup(driver.page_source, 'html.parser').select_one("article.grid-box div.post-title a")
+                        # Dizi sayfasındaki bölümler genelde article.grid-box içindedir
+                        ep_soup = BeautifulSoup(driver.page_source, 'html.parser')
+                        # İlk bölümü (genelde son eklenen) al
+                        ep_tag = ep_soup.select_one("article.grid-box div.post-title a")
                         
                         if ep_tag:
+                            full_title = f"{series_name} - {ep_tag.text.strip()}"
                             m3u_link = resolve_stream(driver, ep_tag['href'])
+                            
                             if m3u_link:
-                                print(f"    ✅ LİNK: {m3u_link[:40]}...")
-                                line = f'#EXTINF:-1 group-title="{cat_name}" tvg-logo="{poster_url}", {series_name} - {ep_tag.text.strip()}\n{m3u_link}'
+                                print(f"    ✅ EKLENDİ: {full_title}")
+                                line = f'#EXTINF:-1 group-title="{cat_name}" tvg-logo="{poster_url}", {full_title}\n{m3u_link}'
                                 all_m3u_lines.append(line)
-                                # Dosyayı anlık kaydet
                                 with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
                                     f.write("\n".join(all_m3u_lines))
-                    except:
-                        print("    ! Bölüm listesi yüklenemedi.")
+                    except Exception as e:
+                        # Dizi sayfası yüklenemezse geç
+                        pass
 
     except Exception as e:
-        print(f"Genel Beklenmedik Hata: {e}")
+        print(f"Genel Hata: {e}")
     finally:
         driver.quit()
         print("\nİşlem Tamamlandı.")
