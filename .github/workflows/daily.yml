@@ -1,0 +1,36 @@
+name: Generate Dizilla M3U
+
+on:
+  schedule:
+    - cron: '0 0 * * *' # Run daily at midnight UTC
+  workflow_dispatch: # Allows manual triggering
+
+jobs:
+  scrape-and-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x' # Use the latest Python 3 version
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run scraper script
+        run: python scraper.py
+
+      - name: Commit M3U file
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "feat: Update dizilla.m3u"
+          file_pattern: "dizilla/dizilla.m3u"
+          # Optional: You can specify a different branch to commit to
+          # branch: main # or master, etc.
+          # For public repositories, the GITHUB_TOKEN has write permissions by default.
+          # For private repositories, you might need to enable 'Write' permissions in Settings > Actions > General > Workflow permissions.
