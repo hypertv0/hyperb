@@ -1,0 +1,42 @@
+name: Dizilla Günlük Güncelleme
+
+on:
+  schedule:
+    # Her gün gece 03:00'te çalışır (UTC)
+    - cron: '0 3 * * *'
+  workflow_dispatch: # Manuel çalıştırma butonu ekler
+
+permissions:
+  contents: write
+
+jobs:
+  update-m3u:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Depoyu Çek (Checkout)
+      uses: actions/checkout@v3
+
+    - name: Python Kurulumu
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+
+    - name: Kütüphaneleri Yükle
+      run: |
+        pip install -r dizilla/requirements.txt
+
+    - name: Scraper Kodunu Çalıştır
+      # Dizilla klasörüne girip kodu çalıştırır
+      run: |
+        cd dizilla
+        python main.py
+
+    - name: Değişiklikleri Commit ve Push Yap
+      run: |
+        git config --global user.name "GitHub Action"
+        git config --global user.email "action@github.com"
+        
+        # Sadece m3u dosyası değişmişse commit at
+        git add dizilla/dizibox.m3u
+        git diff --quiet && git diff --staged --quiet || (git commit -m "Otomatik M3U Güncellemesi: $(date)" && git push)
