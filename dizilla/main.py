@@ -13,9 +13,10 @@ from selenium.webdriver.support import expected_conditions as EC
 
 # --- AYARLAR ---
 BASE_URL = "https://www.dizibox.live"
-TARGET_URL = "https://www.dizibox.live/tum-bolumler/page/{}/"
+# Dizilerin listesinin olduğu XML (Genelde engellenmez)
+SITEMAP_URL = "https://www.dizibox.live/tvseries-sitemap.xml"
 OUTPUT_FILE = "dizibox.m3u"
-MAX_PAGES = 3
+MAX_SERIES_TO_CHECK = 1000 # Kaç dizi taransın? (Hız için limit koyabilirsiniz)
 
 def get_chrome_major_version():
     try:
@@ -31,7 +32,6 @@ def get_driver():
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--window-size=1920,1080")
-    # MOBİL GÖRÜNÜMDEN KURTULMAK İÇİN MASAÜSTÜ USER-AGENT
     options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36")
     
     chrome_path = shutil.which("google-chrome") or shutil.which("google-chrome-stable")
@@ -39,10 +39,7 @@ def get_driver():
 
     version = get_chrome_major_version()
     try:
-        if version:
-            driver = uc.Chrome(options=options, version_main=version)
-        else:
-            driver = uc.Chrome(options=options)
+        driver = uc.Chrome(options=options, version_main=version) if version else uc.Chrome(options=options)
     except:
         driver = uc.Chrome(options=options)
     return driver
@@ -71,38 +68,23 @@ def decrypt_openssl(passphrase, encrypted_base64):
         return decrypted[:-decrypted[-1]].decode('utf-8')
     except: return None
 
-# --- STREAM VE DETAY ÇÖZÜCÜ ---
-def resolve_episode_details(driver, episode_url):
-    details = {"stream": None, "category": "Genel", "poster": ""}
-    
+# --- BÖLÜM ÇÖZÜCÜ ---
+def resolve_episode_stream(driver, episode_url):
+    stream_url = None
     try:
         driver.get(episode_url)
-        
-        # Video alanı yüklenene kadar bekle
+        # Video iframe'ini bekle
         try:
-            WebDriverWait(driver, 8).until(
+            WebDriverWait(driver, 6).until(
                 EC.presence_of_element_located((By.CSS_SELECTOR, "div#video-area iframe"))
             )
         except: return None
 
-        soup = BeautifulSoup(driver.page_source, 'html.parser')
-        
-        # Poster (Lazy load kontrolü)
-        poster_tag = soup.select_one("div.tv-poster img") or soup.select_one("img.wp-post-image") or soup.select_one("img.poster")
-        if poster_tag:
-            details["poster"] = poster_tag.get("data-src") or poster_tag.get("src") or ""
-
-        # Kategori
-        cat_tags = soup.select("a[href*='/tur/']")
-        if cat_tags:
-            details["category"] = cat_tags[0].text.strip()
-
-        # Video Linki
         iframe = driver.find_element(By.CSS_SELECTOR, "div#video-area iframe")
         src = iframe.get_attribute("src").replace("php?v=", "php?wmode=opaque&v=")
         
         driver.get(src)
-        time.sleep(1.5)
+        time.sleep(1)
         
         embed = driver.find_element(By.CSS_SELECTOR, "div#Player iframe")
         embed_url = embed.get_attribute("src")
@@ -116,104 +98,145 @@ def resolve_episode_details(driver, episode_url):
         time.sleep(1)
         src_code = driver.page_source
         
+        # M3U8 veya Şifreli Link
         if "dbx.molystream" in embed_url:
             for line in src_code.splitlines():
                 if "http" in line and "m3u8" in line:
                     match = re.search(r'(https?://[^\s<"]+)', line)
-                    if match: details["stream"] = match.group(1)
+                    if match: stream_url = match.group(1)
 
-        crypt_data = re.search(r'CryptoJS\.AES\.decrypt\(\"(.*?)\",\"', src_code)
-        crypt_pass = re.search(r'\",\"(.*?)\"\);', src_code)
-        
-        if crypt_data and crypt_pass:
-            dec = decrypt_openssl(crypt_pass.group(1), crypt_data.group(1))
-            if dec:
-                match = re.search(r"file:\s*'(.*?)'", dec) or re.search(r'file:\s*"(.*?)"', dec)
-                if match: details["stream"] = match.group(1)
-                
+        if not stream_url:
+            crypt_data = re.search(r'CryptoJS\.AES\.decrypt\(\"(.*?)\",\"', src_code)
+            crypt_pass = re.search(r'\",\"(.*?)\"\);', src_code)
+            if crypt_data and crypt_pass:
+                dec = decrypt_openssl(crypt_pass.group(1), crypt_data.group(1))
+                if dec:
+                    match = re.search(r"file:\s*'(.*?)'", dec) or re.search(r'file:\s*"(.*?)"', dec)
+                    if match: stream_url = match.group(1)
+                    
     except Exception as e:
-        print(f"    ! Detay hatası: {e}")
+        print(f"    ! Hata: {e}")
     
-    return details
+    return stream_url
 
-def main():
-    print("DiziBox Tarayıcı (Regex Modu) Başlatılıyor...")
-    driver = get_driver()
+def get_series_list(driver):
+    """Sitemap veya Ana Sayfadan Dizi Linklerini Toplar"""
+    series_urls = []
     
-    all_m3u_lines = ["#EXTM3U"]
-
+    # 1. Yöntem: Sitemap (En Temizi)
+    print("--- 1. Yöntem: Sitemap Taranıyor ---")
     try:
-        # Ana Sayfaya Git ve Çerezleri Bas
+        driver.get(SITEMAP_URL)
+        time.sleep(3)
+        soup = BeautifulSoup(driver.page_source, 'xml') # XML parser
+        locs = soup.find_all("loc")
+        if not locs: # Eğer XML çalışmazsa HTML olarak dene
+             soup = BeautifulSoup(driver.page_source, 'html.parser')
+             locs = soup.find_all("loc")
+             
+        for loc in locs:
+            url = loc.text.strip()
+            if "/diziler/" in url:
+                series_urls.append(url)
+        
+        print(f"Sitemap'ten {len(series_urls)} dizi bulundu.")
+    except Exception as e:
+        print(f"Sitemap hatası: {e}")
+
+    # 2. Yöntem: Sitemap boşsa Ana Sayfa'yı tara (Yedek Plan)
+    if len(series_urls) < 5:
+        print("--- 2. Yöntem: Ana Sayfa Taranıyor ---")
         driver.get(BASE_URL)
         time.sleep(5)
-        cookies = [
-            {"name": "LockUser", "value": "true", "domain": ".dizibox.live"},
-            {"name": "isTrustedUser", "value": "true", "domain": ".dizibox.live"},
-            {"name": "dbxu", "value": "1744054959089", "domain": ".dizibox.live"}
-        ]
-        for c in cookies: 
-            try: driver.add_cookie(c)
-            except: pass
-        driver.refresh()
+        soup = BeautifulSoup(driver.page_source, 'html.parser')
+        links = soup.find_all('a', href=True)
+        for link in links:
+            href = link['href']
+            if "/diziler/" in href and href not in series_urls:
+                series_urls.append(href)
+        print(f"Ana sayfadan {len(series_urls)} dizi eklendi.")
+    
+    # Listeyi karıştır veya ters çevir ki hep aynıları gelmesin (İsteğe bağlı)
+    # series_urls.reverse() 
+    return series_urls[:MAX_SERIES_TO_CHECK]
 
-        for page in range(1, MAX_PAGES + 1):
-            url = TARGET_URL.format(page)
-            print(f"\n--- Sayfa {page} Taranıyor: {url} ---")
+def main():
+    print("DiziBox Akıllı Tarayıcı Başlatılıyor...")
+    driver = get_driver()
+    all_m3u_lines = ["#EXTM3U"]
+    
+    try:
+        # Önce Dizi Listesini Oluştur
+        series_list = get_series_list(driver)
+        
+        if not series_list:
+            print("❌ Hiç dizi bulunamadı! Site tamamen engelliyor olabilir.")
+            return
+
+        print(f"Toplam {len(series_list)} dizi işlenecek.")
+
+        for i, series_url in enumerate(series_list):
+            print(f"[{i+1}/{len(series_list)}] Diziye Gidiliyor: {series_url}")
             
-            driver.get(url)
-            time.sleep(4) # Sayfanın iyice yüklenmesini bekle
-            
-            # BeautifulSoup ile tüm linkleri çek
-            soup = BeautifulSoup(driver.page_source, 'html.parser')
-            all_links = soup.find_all('a', href=True)
-            
-            episode_list = []
-            seen_urls = set()
-            
-            print(f"  > Sayfada toplam {len(all_links)} link bulundu. Filtreleniyor...")
-            
-            # --- ÖNEMLİ KISIM: REGEX İLE LİNK BULMA ---
-            # CSS Class'ına bakmaksızın, URL yapısında "sezon" ve "bolum" geçenleri alıyoruz.
-            for link in all_links:
-                href = link['href']
-                # DiziBox URL formatı: .../dizi-adi-1-sezon-1-bolum-izle/
-                if "sezon" in href and "bolum" in href and "diziler" not in href:
-                    if href not in seen_urls:
-                        title = link.get_text(strip=True)
-                        if not title: # Text yoksa title attribute dene
-                            title = link.get('title', '').strip()
-                        if not title: # Hala yoksa URL'den üret
-                            title = href.split('/')[-2].replace('-', ' ').title()
+            try:
+                driver.get(series_url)
+                # Dizi sayfasının yüklenmesini bekle
+                try:
+                    WebDriverWait(driver, 5).until(
+                        EC.presence_of_element_located((By.CSS_SELECTOR, "article.grid-box, img.wp-post-image"))
+                    )
+                except:
+                    print("  ⚠️ Sayfa yüklenemedi veya boş.")
+                    continue
+
+                # Başlık ve Poster
+                soup = BeautifulSoup(driver.page_source, 'html.parser')
+                title_h1 = soup.select_one("h1.post-title") 
+                series_name = title_h1.text.strip() if title_h1 else "Bilinmeyen Dizi"
+                
+                poster_tag = soup.select_one("div.tv-poster img") or soup.select_one("img.wp-post-image")
+                poster_url = ""
+                if poster_tag:
+                    poster_url = poster_tag.get("data-src") or poster_tag.get("src") or ""
+                
+                # Tür (Kategori)
+                cat_tag = soup.select_one("div.tv-poster-meta a") or soup.select_one("a[href*='/tur/']")
+                category = cat_tag.text.strip() if cat_tag else "Genel"
+
+                # En Son Bölümü Bul (Genelde listenin en üstündeki grid-box)
+                # Dizi sayfasında bölümler "article.grid-box" içindedir
+                episodes = soup.select("article.grid-box div.post-title a")
+                
+                if not episodes:
+                    # Alternatif yapı: Tablo veya liste olabilir
+                    episodes = soup.select("li.season-episode a") 
+                
+                if episodes:
+                    # En üstteki bölüm (Son Bölüm)
+                    last_ep_link = episodes[0]
+                    ep_title = last_ep_link.text.strip()
+                    ep_href = last_ep_link['href']
+                    
+                    full_title = f"{series_name} - {ep_title}"
+                    print(f"  > Son Bölüm İnceleniyor: {ep_title}")
+                    
+                    stream_link = resolve_episode_stream(driver, ep_href)
+                    
+                    if stream_link:
+                        print(f"    ✅ LİNK: {stream_link[:40]}...")
+                        line = f'#EXTINF:-1 group-title="{category}" tvg-logo="{poster_url}", {full_title}\n{stream_link}'
+                        all_m3u_lines.append(line)
                         
-                        episode_list.append((href, title))
-                        seen_urls.add(href)
-
-            print(f"  > {len(episode_list)} adet izlenebilir bölüm tespit edildi.")
-            
-            if not episode_list:
-                print("  ⚠️ Bölüm bulunamadı! Sayfa yapısı veya Cloudflare engeli olabilir.")
-                print(f"  Görülen Sayfa Başlığı: {driver.title}")
-                continue
-
-            for href, title in episode_list:
-                print(f"  > İşleniyor: {title}")
-                
-                details = resolve_episode_details(driver, href)
-                
-                if details and details["stream"]:
-                    category = details["category"]
-                    poster = details["poster"]
-                    clean_title = title.replace("\n", " ").strip()
-                    
-                    print(f"    ✅ LİNK: {clean_title} ({category})")
-                    
-                    line = f'#EXTINF:-1 group-title="{category}" tvg-logo="{poster}", {clean_title}\n{details["stream"]}'
-                    all_m3u_lines.append(line)
-                    
-                    with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
-                        f.write("\n".join(all_m3u_lines))
+                        # Dosyayı her başarılı işlemde güncelle
+                        with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+                            f.write("\n".join(all_m3u_lines))
+                    else:
+                        print("    ❌ Stream çözülemedi.")
                 else:
-                    print("    ❌ Stream yok.")
+                    print("  ⚠️ Bölüm bulunamadı.")
+            
+            except Exception as e:
+                print(f"  Dizi işleme hatası: {e}")
 
     except Exception as e:
         print(f"Genel Hata: {e}")
