@@ -4,6 +4,8 @@ import base64
 import hashlib
 import time
 import subprocess
+import shutil
+import os
 from bs4 import BeautifulSoup
 from Crypto.Cipher import AES
 from selenium.webdriver.common.by import By
@@ -14,14 +16,11 @@ OUTPUT_FILE = "dizibox.m3u"
 MAX_PAGES = 3
 
 def get_chrome_major_version():
-    """Sistemdeki yüklü Chrome sürümünün ana numarasını (örn: 142) bulur"""
+    """Sistemdeki yüklü Chrome sürümünün ana numarasını bulur"""
     try:
-        # Linux ortamında versiyonu sor
         output = subprocess.check_output(['google-chrome', '--version'], stderr=subprocess.STDOUT)
-        version_str = output.decode('utf-8').strip() # Örn: "Google Chrome 142.0.7444.0"
+        version_str = output.decode('utf-8').strip()
         print(f"Sistemdeki Chrome: {version_str}")
-        
-        # Sadece sayıyı al
         match = re.search(r'Chrome (\d+)', version_str)
         if match:
             return int(match.group(1))
@@ -35,14 +34,29 @@ def get_driver():
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--window-size=1920,1080")
     
+    # --- KRİTİK DÜZELTME: Chrome Yolunu Zorla Belirt ---
+    # Sistemdeki 'google-chrome' komutunun nereye gittiğini buluyoruz (Bu v143 olan)
+    chrome_path = shutil.which("google-chrome") or shutil.which("google-chrome-stable")
+    
+    if chrome_path:
+        print(f"Kullanılacak Chrome Yolu: {chrome_path}")
+        options.binary_location = chrome_path
+    else:
+        print("UYARI: Chrome yolu bulunamadı, varsayılan kullanılacak.")
+
+    # Versiyonu al ve eşleşen sürücüyü iste
     version = get_chrome_major_version()
     
-    # Eğer versiyonu bulduysak (örn 142), onu zorla. Bulamazsak otomatiğe bırak.
-    if version:
-        print(f"ChromeDriver sürümü {version} olarak ayarlanıyor...")
-        driver = uc.Chrome(options=options, version_main=version)
-    else:
-        print("Versiyon algılanamadı, en son sürüm deneniyor...")
+    try:
+        if version:
+            print(f"ChromeDriver {version} sürümü ile başlatılıyor...")
+            driver = uc.Chrome(options=options, version_main=version)
+        else:
+            driver = uc.Chrome(options=options)
+    except Exception as e:
+        print(f"Sürücü başlatma hatası: {e}")
+        # Son bir deneme, versiyon belirtmeden
+        print("Versiyonsuz deneniyor...")
         driver = uc.Chrome(options=options)
         
     return driver
@@ -76,13 +90,11 @@ def resolve_stream(driver, episode_url):
         driver.get(episode_url)
         time.sleep(4) 
         
-        # Iframe Bul
         try:
             iframe = driver.find_element(By.CSS_SELECTOR, "div#video-area iframe")
             src = iframe.get_attribute("src").replace("php?v=", "php?wmode=opaque&v=")
         except: return None
 
-        # Player'a git
         driver.get(src)
         time.sleep(2)
         
@@ -96,7 +108,6 @@ def resolve_stream(driver, episode_url):
             if "/embed/" in embed_url and "/sheila/" not in embed_url:
                 embed_url = embed_url.replace("/embed/", "/embed/sheila/")
         
-        # Şifre Çöz
         driver.get(embed_url)
         time.sleep(1)
         src_code = driver.page_source
@@ -120,15 +131,15 @@ def resolve_stream(driver, episode_url):
     return None
 
 def main():
-    print("DiziBox Tarayıcı Başlatılıyor (Otomatik Versiyon)...")
+    print("DiziBox Tarayıcı Başlatılıyor (Path Zorlamalı)...")
     try:
         driver = get_driver()
     except Exception as e:
-        print(f"Driver başlatılamadı: {e}")
+        print(f"CRITICAL ERROR: {e}")
         exit(1)
 
-    # Siteye Giriş (Cookie Ayarı)
     try:
+        # Siteye Giriş (Cookie Ayarı)
         driver.get(BASE_URL)
         time.sleep(5)
         cookies = [
@@ -136,15 +147,15 @@ def main():
             {"name": "isTrustedUser", "value": "true", "domain": ".dizibox.live"},
             {"name": "dbxu", "value": "1744054959089", "domain": ".dizibox.live"}
         ]
-        for c in cookies: driver.add_cookie(c)
+        for c in cookies: 
+            try: driver.add_cookie(c)
+            except: pass
         driver.refresh()
         time.sleep(3)
-    except: pass
-
-    categories = [("Aksiyon", "aksiyon"), ("Komedi", "komedi")]
-    all_m3u_lines = ["#EXTM3U"]
-    
-    try:
+        
+        categories = [("Aksiyon", "aksiyon"), ("Komedi", "komedi")]
+        all_m3u_lines = ["#EXTM3U"]
+        
         for cat_name, cat_slug in categories:
             print(f"--- Kategori: {cat_name} ---")
             for page in range(1, MAX_PAGES + 1):
@@ -168,15 +179,17 @@ def main():
                     driver.get(series_href)
                     time.sleep(2)
                     
-                    # Son bölümü al
                     ep_tag = BeautifulSoup(driver.page_source, 'html.parser').select_one("article.grid-box div.post-title a")
                     if ep_tag:
                         m3u_link = resolve_stream(driver, ep_tag['href'])
                         if m3u_link:
+                            print(f"    + Link Bulundu: {m3u_link[:50]}...")
                             line = f'#EXTINF:-1 group-title="{cat_name}" tvg-logo="{poster_url}", {series_name} - {ep_tag.text.strip()}\n{m3u_link}'
                             all_m3u_lines.append(line)
                             with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
                                 f.write("\n".join(all_m3u_lines))
+    except Exception as e:
+        print(f"Genel Hata: {e}")
     finally:
         driver.quit()
         print("İşlem Bitti.")
