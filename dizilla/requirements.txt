@@ -1,4 +1,4 @@
-DrissionPage
-curl_cffi
-pycryptodome
+cloudscraper
 beautifulsoup4
+pycryptodome
+requests
