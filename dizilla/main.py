@@ -12,20 +12,14 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from bs4 import BeautifulSoup
 
-# --- KOTLIN EKLENTİSİNDEN ALINAN AYARLAR ---
+# --- AYARLAR ---
 BASE_URL = "https://www.dizibox.live"
-TARGET_URL_TEMPLATE = "https://www.dizibox.live/tum-bolumler/page/{}/" 
 OUTPUT_FILE = "dizibox.m3u"
-# Eklentideki 'dbxu' değeri zaman damgasıdır, güncel tutmak için şimdikini kullanacağız
-COOKIES = [
-    {"name": "LockUser", "value": "true", "domain": ".dizibox.live"},
-    {"name": "isTrustedUser", "value": "true", "domain": ".dizibox.live"},
-    {"name": "dbxu", "value": "1744054959089", "domain": ".dizibox.live"} 
-]
-MAX_PAGES = 5  # Kaç sayfa taranacak? (Her sayfada yakl. 24 bölüm var)
+# Hız için limit (0 = Sınırsız, 5 = Her listeden 5er tane alır test için)
+# Tüm siteyi çekmek istiyorsan burayı 0 yap veya çok yüksek bir sayı ver.
+TEST_LIMIT = 0 
 
 def get_chrome_version():
-    """Sistemdeki Chrome sürümünü bulur"""
     try:
         output = subprocess.check_output(['google-chrome', '--version'], stderr=subprocess.STDOUT)
         version = re.search(r'Chrome (\d+)', output.decode('utf-8')).group(1)
@@ -38,8 +32,8 @@ def get_driver():
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--window-size=1920,1080")
-    # Kotlin eklentisi gibi davranmak için standart User-Agent
-    options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+    # HTML dosyasındaki mobil görünümü simüle etmek için aynı User-Agent'ı kullanıyoruz
+    options.add_argument("--user-agent=Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Mobile Safari/537.36")
     
     chrome_path = shutil.which("google-chrome") or shutil.which("google-chrome-stable")
     if chrome_path: options.binary_location = chrome_path
@@ -54,7 +48,7 @@ def get_driver():
         driver = uc.Chrome(options=options)
     return driver
 
-# --- EKLENTİDEKİ ŞİFRE ÇÖZME MANTIĞI (CryptoJS) ---
+# --- ŞİFRE ÇÖZME ---
 def bytes_to_key(data, salt, output=48):
     data = data.encode('utf-8') + salt
     key = hashlib.md5(data).digest()
@@ -79,155 +73,163 @@ def decrypt_openssl(passphrase, encrypted_base64):
     except: return None
 
 def resolve_stream(driver, episode_url):
-    """Kotlin dosyasındaki iframeDecode mantığının aynısı"""
+    """Verilen bölüm linkine gider ve videoyu çözer"""
     try:
         driver.get(episode_url)
         
-        # 1. Video Iframe'ini Bekle
+        # Iframe'in yüklenmesini bekle (HTML yapısında div#video-area var)
         try:
-            WebDriverWait(driver, 8).until(
+            WebDriverWait(driver, 6).until(
                 EC.presence_of_element_located((By.CSS_SELECTOR, "div#video-area iframe"))
             )
-        except: return None # Zaman aşımı
+        except: return None
 
-        # 2. Ana iframe linkini al ve düzelt
         iframe = driver.find_element(By.CSS_SELECTOR, "div#video-area iframe")
-        iframe_src = iframe.get_attribute("src")
+        src = iframe.get_attribute("src")
         
-        # Eklentideki düzeltme: php?v= -> php?wmode=opaque&v=
-        if "php?v=" in iframe_src:
-            iframe_src = iframe_src.replace("php?v=", "php?wmode=opaque&v=")
+        # Link düzeltme
+        if "php?v=" in src:
+            src = src.replace("php?v=", "php?wmode=opaque&v=")
             
-        # 3. Player iframe'ine git (King player vb.)
-        driver.get(iframe_src)
+        driver.get(src)
         time.sleep(1.5)
         
-        # 4. İçteki embed iframe'i al (vidmoly/sheila)
+        # Player Iframe (Vidmoly/Sheila)
         try:
             embed = driver.find_element(By.CSS_SELECTOR, "div#Player iframe")
             embed_url = embed.get_attribute("src")
         except: return None
             
-        # Eklentideki URL düzeltmeleri
         if "vidmoly" in embed_url:
             embed_url = embed_url.replace("vidmoly.me", "vidmoly.net")
             if "/embed/" in embed_url and "/sheila/" not in embed_url:
                 embed_url = embed_url.replace("/embed/", "/embed/sheila/")
         
-        # 5. Son durak: Kaynağı çöz
         driver.get(embed_url)
         time.sleep(1)
         src_code = driver.page_source
         
-        # A: Doğrudan M3U8 (dbx.molystream)
+        # M3U8 veya Şifre
         if "dbx.molystream" in embed_url:
             match = re.search(r'(https?://[^\s<"]+\.m3u8[^\s<"]*)', src_code)
             if match: return match.group(1)
 
-        # B: Şifreli (CryptoJS)
         crypt_data = re.search(r'CryptoJS\.AES\.decrypt\(\"(.*?)\",\"', src_code)
         crypt_pass = re.search(r'\",\"(.*?)\"\);', src_code)
         
         if crypt_data and crypt_pass:
             dec = decrypt_openssl(crypt_pass.group(1), crypt_data.group(1))
             if dec:
-                # file: '...' yapısını bul
                 match = re.search(r"file:\s*'(.*?)'", dec) or re.search(r'file:\s*"(.*?)"', dec)
                 if match: return match.group(1)
                 
-    except Exception as e:
-        # Hata ayıklama için (gerekirse print açılabilir)
-        pass
+    except: pass
     return None
 
 def main():
-    print("DiziBox (Plugin-Based) Başlatılıyor...")
+    print("DiziBox HTML Analiz Modu Başlatılıyor...")
     driver = get_driver()
     all_m3u_lines = ["#EXTM3U"]
     
     try:
-        # 1. Ana Sayfaya Git ve Eklenti Çerezlerini Bas
+        # 1. Ana Sayfayı Aç (Tüm içerik burada gizli)
+        print(f"Ana sayfaya gidiliyor: {BASE_URL}")
         driver.get(BASE_URL)
-        time.sleep(5) # Cloudflare kontrolü için bekle
+        time.sleep(7) # Sayfanın ve overlay'in yüklenmesi için bekle
         
-        for cookie in COOKIES:
-            try: driver.add_cookie(cookie)
-            except: pass
+        soup = BeautifulSoup(driver.page_source, 'html.parser')
         
-        driver.refresh()
-        time.sleep(3)
+        # LİSTE 1: YENİ EKLENEN BÖLÜMLER (HTML: section#recent-posts)
+        print("\n--- 1. Yeni Eklenen Bölümler Taranıyor ---")
+        recent_posts = soup.select("section#recent-posts article.post-box-grid")
+        print(f"Bulunan yeni bölüm sayısı: {len(recent_posts)}")
+        
+        process_list = []
+        
+        for post in recent_posts:
+            link_tag = post.select_one("div.box-details a")
+            if not link_tag: continue
+            
+            href = link_tag.get('href')
+            title_tag = post.select_one("strong.archive")
+            ep_tag = post.select_one("span.season")
+            
+            title = title_tag.text.strip() if title_tag else "Bilinmeyen Dizi"
+            episode = ep_tag.text.strip() if ep_tag else ""
+            full_title = f"{title} - {episode}"
+            img_tag = post.select_one("div.box-image")
+            poster = img_tag.get('data-src') if img_tag else ""
+            
+            process_list.append({
+                "title": full_title,
+                "url": href,
+                "poster": poster,
+                "category": "Yeni Eklenenler"
+            })
 
-        # 2. Sayfaları Gez (/tum-bolumler/page/X/)
-        for page in range(1, MAX_PAGES + 1):
-            url = TARGET_URL_TEMPLATE.format(page)
-            print(f"\n--- Sayfa {page} Taranıyor: {url} ---")
+        # LİSTE 2: TÜM DİZİLER LİSTESİ (HTML: ul#all-tv-series-list)
+        print("\n--- 2. Tüm Dizi Listesi Taranıyor ---")
+        all_series_list = soup.select("ul#all-tv-series-list li.search-target a")
+        print(f"Bulunan toplam dizi sayısı: {len(all_series_list)}")
+        
+        for item in all_series_list:
+            href = item.get('href')
+            name = item.text.strip()
+            img_tag = item.select_one("img")
+            poster = img_tag.get('data-src') if img_tag else ""
             
-            driver.get(url)
-            
-            # Yönlendirme Kontrolü: Eğer bizi ana sayfaya attıysa bu sayfa bozuktur veya erişim yoktur
-            current_url = driver.current_url
-            if current_url.rstrip('/') == BASE_URL.rstrip('/'):
-                print("⚠️ Site Ana Sayfaya yönlendirdi! Erişim engellendi veya sayfa bitti.")
-                # Ana sayfadaysak, bari ana sayfadaki son bölümleri alalım
-                # Bu 'yedek' plandır.
-            
-            # İçeriğin Yüklenmesini Bekle
-            try:
-                # Eklentideki seçiciler: article.detailed-article
-                WebDriverWait(driver, 10).until(
-                    EC.presence_of_element_located((By.CSS_SELECTOR, "article"))
-                )
-            except:
-                print("⚠️ Sayfada içerik bulunamadı.")
-                continue
+            # Dizinin kendisine gidip son bölümü alacağız
+            # Şimdilik listeye ekle, aşağıda işlenecek
+            process_list.append({
+                "title": name,
+                "url": href,
+                "poster": poster,
+                "category": "Arşiv",
+                "is_series_page": True # Bu bir dizi sayfası, bölüm değil
+            })
 
-            soup = BeautifulSoup(driver.page_source, 'html.parser')
+        # --- LİNKLERİ İŞLEME ---
+        if TEST_LIMIT > 0:
+            process_list = process_list[:TEST_LIMIT]
             
-            # Eklentideki seçicileri Python'a uyarlıyoruz
-            # document.select("article.detailed-article, article.article-episode-card a.figure-link")
-            articles = soup.select("article.detailed-article, article.grid-box")
+        print(f"\nToplam işlenecek öğe: {len(process_list)}")
+        
+        for i, item in enumerate(process_list):
+            print(f"[{i+1}/{len(process_list)}] İşleniyor: {item['title']}")
             
-            print(f"  > {len(articles)} içerik bulundu.")
+            target_url = item['url']
+            
+            # Eğer bu bir dizi sayfasıysa, içine girip son bölümü bulmalıyız
+            if item.get("is_series_page"):
+                try:
+                    driver.get(target_url)
+                    time.sleep(2)
+                    # Dizi sayfasında son bölümü bul (genelde en üstteki article.grid-box)
+                    series_soup = BeautifulSoup(driver.page_source, 'html.parser')
+                    last_ep = series_soup.select_one("article.grid-box div.post-title a")
+                    if last_ep:
+                        target_url = last_ep.get('href')
+                        item['title'] += " - " + last_ep.text.strip()
+                    else:
+                        print("  > Bölüm bulunamadı, geçiliyor.")
+                        continue
+                except:
+                    continue
 
-            for art in articles:
-                # Linki ve Başlığı bul
-                # Eklenti mantığı: h3 a -> text
-                title_tag = art.select_one("h3 a") or art.select_one("div.post-title a") or art.select_one("a.figure-link")
+            # Stream linkini çöz
+            stream_link = resolve_stream(driver, target_url)
+            
+            if stream_link:
+                print(f"  ✅ LİNK: {stream_link[:40]}...")
+                line = f'#EXTINF:-1 group-title="{item["category"]}" tvg-logo="{item["poster"]}", {item["title"]}\n{stream_link}'
+                all_m3u_lines.append(line)
                 
-                if not title_tag: continue
-                
-                # Eklentideki regex temizliği: -[0-9]+-.* yerine /
-                # Biz doğrudan linki alıyoruz, regex'e gerek yok
-                episode_url = title_tag['href']
-                full_title = title_tag.text.strip()
-                
-                # Posteri bul
-                img_tag = art.select_one("img")
-                poster_url = ""
-                if img_tag:
-                    poster_url = img_tag.get("data-src") or img_tag.get("src") or ""
-
-                # Eklenti türü sadece "TvSeries" olarak alıyor, biz de "Son Bölümler" diyelim
-                # Veya sayfadan türü çekmeye çalışalım
-                category = "Son Eklenenler"
-                
-                print(f"  > İşleniyor: {full_title}")
-                
-                # Stream linkini çöz
-                stream_link = resolve_stream(driver, episode_url)
-                
-                if stream_link:
-                    print(f"    ✅ LİNK: {stream_link[:40]}...")
-                    
-                    line = f'#EXTINF:-1 group-title="{category}" tvg-logo="{poster_url}", {full_title}\n{stream_link}'
-                    all_m3u_lines.append(line)
-                    
-                    # Dosyayı kaydet
-                    with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
-                        f.write("\n".join(all_m3u_lines))
-                else:
-                    # print("    ❌ Stream yok.")
-                    pass
+                # Dosyaya yaz
+                with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+                    f.write("\n".join(all_m3u_lines))
+            else:
+                pass
+                # print("  ❌ Stream yok.")
 
     except Exception as e:
         print(f"Genel Hata: {e}")
